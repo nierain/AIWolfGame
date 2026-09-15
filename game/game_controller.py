@@ -1,7 +1,7 @@
 from typing import Dict, List, Optional
 import time
 import logging
-from .roles import BaseRole, Werewolf, Villager, RoleType, Seer, Witch, Hunter, Guard, Idiot, WolfKing, Knight
+from .roles import BaseRole, Werewolf, WolfBeauty, Villager, RoleType, Seer, Witch, Hunter, Guard, Idiot, WolfKing, Knight
 from .ai_players import create_ai_agent, BaseAIAgent
 import random
 import re
@@ -203,6 +203,9 @@ class GameController:
                 if role_type == "werewolf":
                     role = Werewolf(player_id, name)
                     self.game_state["alive_count"]["werewolf"] += 1
+                elif role_type == "wolf_beauty":
+                    role = WolfBeauty(player_id, name)
+                    self.game_state["alive_count"]["werewolf"] += 1
                 elif role_type == "seer":
                     role = Seer(player_id, name)
                     self.game_state["alive_count"]["villager"] += 1
@@ -251,6 +254,9 @@ class GameController:
                 for player_id, info in players.items():
                     if role_type == "werewolf":
                         role = Werewolf(player_id, info["name"])
+                        self.game_state["alive_count"]["werewolf"] += 1
+                    elif role_type == "wolf_beauty":
+                        role = WolfBeauty(player_id, info["name"])
                         self.game_state["alive_count"]["werewolf"] += 1
                     elif role_type == "seer":
                         role = Seer(player_id, info["name"])
@@ -348,6 +354,8 @@ class GameController:
                   if isinstance(role, Hunter) and role.is_alive]
         guards = [pid for pid, role in self.players.items()
                   if isinstance(role, Guard) and role.is_alive]
+        wolf_beauties = [pid for pid, role in self.players.items()
+                         if isinstance(role, WolfBeauty) and role.is_alive]
         
         victim_id = None  # 狼人的目标
         saved_by_witch = False  # 是否被女巫救活
@@ -403,6 +411,28 @@ class GameController:
                     # 如果有多个狼人，随机选择一个目标
                     victim_id = random.choice(wolf_targets)
                     self._log_deception_attempt(wolves[0], True)
+
+        # 狼美人每晚单独选择魅惑目标
+        for beauty_id in wolf_beauties:
+            beauty = self.players[beauty_id]
+            beauty.charmed_player_id = None
+            result = self.ai_agents[beauty_id].charm(self.game_state)
+            target_id = result.get("target")
+            if (target_id in self.players
+                    and self.players[target_id].is_alive
+                    and target_id != beauty_id
+                    and not self.players[target_id].is_wolf()):
+                beauty.charm(target_id)
+                print(f"\n狼美人 {beauty.name} 魅惑了 {self.players[target_id].name}")
+                self.game_state["history"].append({
+                    "round": self.current_round,
+                    "phase": "night",
+                    "event": "wolf_beauty_charm",
+                    "wolf_beauty": beauty_id,
+                    "target": target_id
+                })
+            else:
+                print(f"\n狼美人 {beauty.name} 的魅惑目标无效，本晚未能魅惑")
         
         # 预言家行动
         if seers:
@@ -621,6 +651,8 @@ class GameController:
     def _handle_death(self, player_id: str, reason: str) -> None:
         """处理玩家死亡"""
         role = self.players[player_id]
+        if not role.is_alive:
+            return
         role.is_alive = False
         
         # 更新存活计数
@@ -646,6 +678,31 @@ class GameController:
         # 记录生存率
         self._log_survival(player_id)
 
+        if isinstance(role, WolfBeauty):
+            self._handle_wolf_beauty_martyrdom(role)
+
+    def _handle_wolf_beauty_martyrdom(self, wolf_beauty: WolfBeauty) -> None:
+        """狼美人死亡时，让当晚仍存活的魅惑目标殉情。"""
+        target_id = wolf_beauty.charmed_player_id
+        if not target_id or target_id not in self.players:
+            return
+        target = self.players[target_id]
+        if not target.is_alive:
+            return
+
+        print(f"\n{target.name} 因狼美人 {wolf_beauty.name} 死亡而殉情")
+        self.game_state["history"].append({
+            "round": self.current_round,
+            "phase": self.game_state["phase"],
+            "event": "wolf_beauty_martyrdom",
+            "wolf_beauty": wolf_beauty.player_id,
+            "target": target_id
+        })
+        if self.game_state["phase"] == "night":
+            self._handle_death(target_id, "因狼美人死亡而殉情")
+        else:
+            self.kill_player(target_id, "因狼美人死亡而殉情", allow_last_words=False)
+
     def day_phase(self) -> None:
         """白天阶段：玩家轮流发言后进行投票"""
         print("\n=== 天亮了 ===")
@@ -667,6 +724,10 @@ class GameController:
 
         # 轮流发言
         self.discussion_phase()
+
+        # 骑士可以在发言后、投票前发动一次决斗
+        if self.knight_challenge_phase():
+            return
         
         # 检查是否有狼人自爆
         if self.wolf_explode_phase():
@@ -675,6 +736,42 @@ class GameController:
         
         # 投票环节
         self.voting_phase()
+
+    def knight_challenge_phase(self) -> bool:
+        """处理骑士白天决斗；发动决斗后立即结束当天。"""
+        knights = [
+            (pid, role) for pid, role in self.players.items()
+            if isinstance(role, Knight) and role.is_alive and role.can_challenge
+        ]
+        for knight_id, knight in knights:
+            result = self.ai_agents[knight_id].challenge(self.game_state)
+            target_id = result.get("target") if result.get("will_challenge") else None
+            if not target_id:
+                continue
+            if (target_id not in self.players
+                    or target_id == knight_id
+                    or not self.players[target_id].is_alive):
+                print(f"\n骑士 {knight.name} 的决斗目标无效")
+                continue
+
+            knight.challenge(target_id)
+            target = self.players[target_id]
+            self.game_state["history"].append({
+                "round": self.current_round,
+                "phase": "day",
+                "event": "knight_challenge",
+                "knight": knight_id,
+                "target": target_id,
+                "target_is_wolf": target.is_wolf()
+            })
+            if target.is_wolf():
+                print(f"\n骑士 {knight.name} 决斗成功，{target.name} 是狼人！")
+                self.kill_player(target_id, "骑士决斗出局", allow_last_words=False)
+            else:
+                print(f"\n骑士 {knight.name} 决斗失败，{target.name} 是好人！")
+                self.kill_player(knight_id, "决斗失败出局", allow_last_words=False)
+            return True
+        return False
 
     def _validate_speech(self, speech: str) -> bool:
         """验证发言是否符合要求"""
@@ -1082,6 +1179,8 @@ class GameController:
         """
         if player_id in self.players:
             player = self.players[player_id]
+            if not player.is_alive:
+                return
             player.is_alive = False
             self.game_state["players"][player_id]["is_alive"] = False
             
@@ -1125,6 +1224,9 @@ class GameController:
                 "player": player_id,
                 "reason": reason
             })
+
+            if isinstance(player, WolfBeauty):
+                self._handle_wolf_beauty_martyrdom(player)
             
             time.sleep(self.delay)
 
@@ -1400,7 +1502,7 @@ class GameController:
             response = agent.ask_ai(prompt, None, self.game_state, speaker_name=role.name, stream=False)
             
             # 检查是否自爆
-            if role.is_wolf() and (("自爆" in response or "爆炸" in response) and not ("不自爆" in response or "不爆炸" in response)):
+            if role.is_wolf() and not isinstance(role, WolfBeauty) and (("自爆" in response or "爆炸" in response) and not ("不自爆" in response or "不爆炸" in response)):
                 print(f"\n【爆炸】{role.name} 选择自爆！")
                 self._handle_wolf_explode(player_id, first_day=True)
                 return []  # 自爆后竞选结束
@@ -1606,7 +1708,7 @@ class GameController:
         """
         # 获取存活的狼人
         wolves = [pid for pid, role in self.players.items() 
-                 if role.is_wolf() and role.is_alive]
+                 if role.is_wolf() and role.is_alive and not isinstance(role, WolfBeauty)]
         
         if not wolves:
             return False
@@ -1780,6 +1882,18 @@ class GameController:
         
         if wolf_count == 0:
             return True
+
+        if self.config.get("rules", {}).get("win_condition") == "屠边":
+            alive_villagers = [
+                role for role in self.players.values()
+                if role.is_alive and role.role_type == RoleType.VILLAGER
+            ]
+            alive_gods = [
+                role for role in self.players.values()
+                if role.is_alive and role.is_god()
+            ]
+            return not alive_villagers or not alive_gods
+
         if wolf_count >= villager_count:
             return True
         return False
@@ -1977,4 +2091,4 @@ class GameController:
         
         # 调用logger记录游戏结束和指标数据
         if hasattr(self, 'logger') and hasattr(self.logger, 'log_game_over'):
-            self.logger.log_game_over(winner, self.game_state) 
+            self.logger.log_game_over(winner, self.game_state)

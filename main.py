@@ -121,7 +121,10 @@ def initialize_statistics():
             "villager": {"wins": 0, "total": 0},
             "seer": {"wins": 0, "total": 0},
             "witch": {"wins": 0, "total": 0},
-            "hunter": {"wins": 0, "total": 0}
+            "hunter": {"wins": 0, "total": 0},
+            "guard": {"wins": 0, "total": 0},
+            "knight": {"wins": 0, "total": 0},
+            "wolf_beauty": {"wins": 0, "total": 0}
         },
         "metrics": {        # 评估指标统计
             "role_recognition_accuracy": [],
@@ -330,9 +333,12 @@ def update_statistics(statistics: dict, game_result: dict, model_assignments: di
     if "final_result" in game_result and "metrics" in game_result["final_result"]:
         metrics_data = game_result["final_result"]["metrics"]
     
+    final_state = game_result.get("final_state") or game_result.get("final_result", {}).get("final_state", {})
+    wolf_roles = {"werewolf", "wolf_king", "stone_ghost", "white_wolf_king", "blood_moon_disciple", "wolf_beauty"}
+
     # 更新模型统计
-    if "final_state" in game_result and "players" in game_result["final_state"]:
-        for player_id, player_data in game_result["final_state"]["players"].items():
+    if "players" in final_state:
+        for player_id, player_data in final_state["players"].items():
             model_type = model_assignments.get(player_id, "unknown")
             role = player_data.get("role", "unknown")
             
@@ -340,13 +346,13 @@ def update_statistics(statistics: dict, game_result: dict, model_assignments: di
             if model_type not in statistics["model_performance"]:
                 statistics["model_performance"][model_type] = {
                     role_type: {"games": 0, "wins": 0} 
-                    for role_type in ["werewolf", "villager", "seer", "witch", "hunter"]
+                    for role_type in ["werewolf", "wolf_beauty", "villager", "seer", "witch", "hunter", "guard", "knight"]
                 }
             
             if role in statistics["model_performance"][model_type]:
                 statistics["model_performance"][model_type][role]["games"] += 1
-                if (winner == "狼人阵营" and role == "werewolf") or \
-                   (winner == "好人阵营" and role != "werewolf"):
+                if (winner == "狼人阵营" and role in wolf_roles) or \
+                   (winner == "好人阵营" and role not in wolf_roles):
                     statistics["model_performance"][model_type][role]["wins"] += 1
             
             # 更新model_stats数据结构
@@ -358,8 +364,8 @@ def update_statistics(statistics: dict, game_result: dict, model_assignments: di
                 }
             
             statistics["model_stats"][model_type]["games"] += 1
-            if (winner == "狼人阵营" and role == "werewolf") or \
-               (winner == "好人阵营" and role != "werewolf"):
+            if (winner == "狼人阵营" and role in wolf_roles) or \
+               (winner == "好人阵营" and role not in wolf_roles):
                 statistics["model_stats"][model_type]["wins"] += 1
                 
             # 如果存在指标数据，更新到对应模型的指标中
@@ -370,7 +376,7 @@ def update_statistics(statistics: dict, game_result: dict, model_assignments: di
                             statistics["model_stats"][model_type]["metrics"][metric_name].append(value)
             
             # 更新游戏详情
-            if role == "werewolf":
+            if role in wolf_roles:
                 game_detail["wolf_models"].append(model_type)
             elif role in ["seer", "witch", "hunter"]:
                 game_detail["special_role_models"].append(f"{role}:{model_type}")
@@ -386,13 +392,13 @@ def update_statistics(statistics: dict, game_result: dict, model_assignments: di
     statistics["game_details"].append(game_detail)
     
     # 更新角色统计
-    if "final_state" in game_result and "players" in game_result["final_state"]:
-        for player_id, player_data in game_result["final_state"]["players"].items():
+    if "players" in final_state:
+        for player_id, player_data in final_state["players"].items():
             role = player_data.get("role", "unknown")
             if role in statistics["role_stats"]:
                 statistics["role_stats"][role]["total"] += 1
-                if (winner == "狼人阵营" and role == "werewolf") or \
-                   (winner == "好人阵营" and role != "werewolf"):
+                if (winner == "狼人阵营" and role in wolf_roles) or \
+                   (winner == "好人阵营" and role not in wolf_roles):
                     statistics["role_stats"][role]["wins"] += 1
     
     # 更新评估指标
@@ -490,6 +496,7 @@ def load_preset_config(preset_num: str) -> Dict:
                         "config_name": selected_config['name'],
                         "total_players": int(preset_num),
                         "werewolf": selected_config.get("werewolf", 0),
+                        "wolf_beauty": selected_config.get("wolf_beauty", 0),
                         "wolf_king": selected_config.get("wolf_king", 0),
                         "stone_ghost": selected_config.get("stone_ghost", 0),
                         "white_wolf_king": selected_config.get("white_wolf_king", 0),
@@ -497,6 +504,8 @@ def load_preset_config(preset_num: str) -> Dict:
                         "seer": selected_config.get("seer", 0),
                         "witch": selected_config.get("witch", 0),
                         "hunter": selected_config.get("hunter", 0),
+                        "guard": selected_config.get("guard", 0),
+                        "knight": selected_config.get("knight", 0),
                         "villager": selected_config.get("villager", 0),
                         "custom_roles": selected_config.get("custom_roles", {}),
                         "rules": selected_config.get("rules", {})
@@ -574,6 +583,7 @@ def select_preset_by_model_count(models: List[str]) -> Optional[Dict]:
                                     "config_name": selected_config['name'],
                                     "total_players": int(preset_num),
                                     "werewolf": selected_config.get("werewolf", 0),
+                                    "wolf_beauty": selected_config.get("wolf_beauty", 0),
                                     "wolf_king": selected_config.get("wolf_king", 0),
                                     "stone_ghost": selected_config.get("stone_ghost", 0),
                                     "white_wolf_king": selected_config.get("white_wolf_king", 0),
@@ -581,6 +591,8 @@ def select_preset_by_model_count(models: List[str]) -> Optional[Dict]:
                                     "seer": selected_config.get("seer", 0),
                                     "witch": selected_config.get("witch", 0),
                                     "hunter": selected_config.get("hunter", 0),
+                                    "guard": selected_config.get("guard", 0),
+                                    "knight": selected_config.get("knight", 0),
                                     "villager": selected_config.get("villager", 0),
                                     "custom_roles": selected_config.get("custom_roles", {}),
                                     "rules": selected_config.get("rules", {})
@@ -619,6 +631,8 @@ def apply_preset_config(preset_config: Dict, role_config: Dict) -> Dict:
         "seer": preset_config["seer"],
         "witch": preset_config["witch"],
         "hunter": preset_config["hunter"],
+        "guard": preset_config.get("guard", 0),
+        "knight": preset_config.get("knight", 0),
         "villager": preset_config["villager"]
     }
     
@@ -633,7 +647,8 @@ def apply_preset_config(preset_config: Dict, role_config: Dict) -> Dict:
         "wolf_king": preset_config.get("wolf_king", 0),
         "stone_ghost": preset_config.get("stone_ghost", 0),
         "white_wolf_king": preset_config.get("white_wolf_king", 0),
-        "blood_moon_disciple": preset_config.get("blood_moon_disciple", 0)
+        "blood_moon_disciple": preset_config.get("blood_moon_disciple", 0),
+        "wolf_beauty": preset_config.get("wolf_beauty", 0)
     }
     
     # 将特殊狼人角色添加到 role_counts
@@ -645,6 +660,7 @@ def apply_preset_config(preset_config: Dict, role_config: Dict) -> Dict:
     
     # 保存特殊狼人角色信息，用于后续处理
     updated_config["special_wolf_roles"] = special_wolf_roles
+    updated_config["rules"] = preset_config.get("rules", {})
     
     # 更新玩家列表
     total_players = preset_config["total_players"]
@@ -773,6 +789,7 @@ def main():
                         "players": role_config.get("players", {}),
                         "model_assignments": model_assignments,
                         "ai_players": ai_config["ai_players"],
+                        "rules": role_config.get("rules", {}),
                         "delay": args.delay,
                         "total_rounds": args.rounds
                     }
@@ -786,6 +803,7 @@ def main():
                         "roles": game_roles,
                         "game_settings": role_config["game_settings"],
                         "ai_players": ai_config["ai_players"],
+                        "rules": role_config.get("rules", {}),
                         "delay": args.delay,
                         "total_rounds": args.rounds
                     }

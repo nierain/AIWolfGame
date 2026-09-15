@@ -63,7 +63,7 @@ def validate_game_config(config: Dict[str, Any]) -> bool:
                 return False
             
             # 计算总角色数（包括特殊狼人角色）
-            special_wolf_roles = ["wolf_king", "stone_ghost", "white_wolf_king", "blood_moon_disciple"]
+            special_wolf_roles = ["wolf_king", "stone_ghost", "white_wolf_king", "blood_moon_disciple", "wolf_beauty"]
             total_roles = sum(role_counts.values())
             total_players = len(players)
             
@@ -155,4 +155,4 @@ def format_game_state(game_state: Dict[str, Any]) -> str:
 def get_random_target(players: List[str], exclude: List[str] = None) -> str:
     """随机选择一个目标（用于AI决策失败时的后备方案）"""
     valid_targets = [p for p in players if p not in (exclude or [])]
-    return random.choice(valid_targets) if valid_targets else "" 
+    return random.choice(valid_targets) if valid_targets else ""

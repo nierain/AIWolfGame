@@ -363,6 +363,27 @@
           "miracle_merchant_give_skill": true,
           "miracle_merchant_death_if_wolf": true
         }
+      },
+      {
+        "name": "狼美人骑士守卫局（预女骑守）",
+        "werewolf": 3,
+        "wolf_beauty": 1,
+        "seer": 1,
+        "witch": 1,
+        "hunter": 0,
+        "guard": 1,
+        "knight": 1,
+        "villager": 4,
+        "rules": {
+          "win_condition": "屠边",
+          "sheriff_election": true,
+          "wolf_self_explode": true,
+          "wolf_beauty_charm": true,
+          "wolf_beauty_martyrdom": true,
+          "knight_challenge": true,
+          "guard_cannot_same_target": true,
+          "witch_same_night": false
+        }
       }
     ]
   }

@@ -13,6 +13,7 @@ import logging
 
 class RoleType(Enum):
     WEREWOLF = "werewolf"
+    WOLF_BEAUTY = "wolf_beauty"  # 狼美人
     VILLAGER = "villager"
     SEER = "seer"        # 预言家
     WITCH = "witch"      # 女巫
@@ -34,7 +35,7 @@ class BaseRole:
 
     def is_wolf(self) -> bool:
         """判断是否是狼人"""
-        return self.role_type == RoleType.WEREWOLF
+        return self.role_type in [RoleType.WEREWOLF, RoleType.WOLF_BEAUTY]
 
     def is_god(self) -> bool:
         """判断是否是神职"""
@@ -43,6 +44,18 @@ class BaseRole:
 class Werewolf(BaseRole):
     def __init__(self, player_id: str, name: str):
         super().__init__(player_id, name, RoleType.WEREWOLF)
+
+class WolfBeauty(BaseRole):
+    """狼美人：每晚魅惑一名非狼人，死亡时被魅惑者殉情。"""
+
+    def __init__(self, player_id: str, name: str):
+        super().__init__(player_id, name, RoleType.WOLF_BEAUTY)
+        self.charmed_player_id = None
+
+    def charm(self, target_id: str) -> None:
+        """记录当晚被魅惑的玩家。"""
+        self.charmed_player_id = target_id
+        self.logger.info(f"狼美人魅惑了玩家 {target_id}")
 
 class Villager(BaseRole):
     def __init__(self, player_id: str, name: str):

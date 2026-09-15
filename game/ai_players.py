@@ -598,6 +598,37 @@ class WerewolfAgent(BaseAIAgent):
         重要：你是狼人，应该投票给好人而不是狼队友！
         """
 
+class WolfBeautyAgent(WerewolfAgent):
+    """狼美人 AI：继承狼人行为，并增加夜间魅惑决策。"""
+
+    def charm(self, game_state: Dict[str, Any]) -> Dict[str, Any]:
+        candidates = [
+            (pid, info["name"])
+            for pid, info in game_state["players"].items()
+            if info["is_alive"]
+            and pid != self.role.player_id
+            and pid not in self.team_members
+        ]
+        prompt = f"""
+你是狼美人 {self.role.name}，现在需要选择今晚的魅惑目标。
+可选玩家：
+{chr(10).join([f'- {name}({pid})' for pid, name in candidates])}
+
+请选择一名非狼人玩家。狼美人死亡时，当晚被魅惑的玩家会随之殉情。
+最后必须用“选择[playerX]”格式给出目标。
+"""
+        response = self.ask_ai(prompt, self._get_charm_prompt(), game_state)
+        return {
+            "type": "charm",
+            "target": self._extract_target(response),
+            "reason": response
+        }
+
+    def _get_charm_prompt(self) -> str:
+        return """【系统提示】你的身份是狼美人，属于狼人阵营。
+每晚必须魅惑一名存活的非狼人玩家。请结合局势选择能在你死亡时给好人阵营造成最大损失的目标。
+不要魅惑自己或狼队友，并用“选择[playerX]”格式给出唯一目标。"""
+
 class VillagerAgent(BaseAIAgent):
     def discuss(self, game_state: Dict[str, Any], speaker_name: Optional[str] = None) -> Dict[str, Any]:
         """村民讨论发言"""
@@ -1312,7 +1343,9 @@ class KnightAgent(BaseAIAgent):
 
 def create_ai_agent(config: Dict[str, Any], role: BaseRole) -> BaseAIAgent:
     """工厂函数：根据角色创建对应的 AI 代理"""
-    if role.role_type == RoleType.WEREWOLF:
+    if role.role_type == RoleType.WOLF_BEAUTY:
+        return WolfBeautyAgent(config, role)
+    elif role.role_type == RoleType.WEREWOLF:
         return WerewolfAgent(config, role)
     elif role.role_type == RoleType.SEER:
         return SeerAgent(config, role)

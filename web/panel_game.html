@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>十二人狼人杀</title>
+  <style>
+    :root { color-scheme: light dark; --bg:#121518; --panel:#1c2126; --soft:#272e34; --line:#3b444c; --text:#f3eee7; --muted:#aaa39a; --gold:#e1b94e; --purple:#bd99d8; --red:#e47d79; --green:#76bd8d; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:var(--bg); color:var(--text); font-family:Inter,"Microsoft YaHei",system-ui,sans-serif; }
+    button,select,textarea { font:inherit; }
+    button { min-height:42px; padding:0 16px; border:1px solid var(--line); border-radius:10px; color:var(--text); background:var(--soft); cursor:pointer; }
+    button.primary { border-color:var(--gold); color:#171717; background:var(--gold); }
+    button.danger { border-color:var(--red); color:var(--red); background:transparent; }
+    button:disabled { cursor:default; opacity:.5; }
+    .app { max-width:1280px; margin:auto; padding:18px; }
+    header { display:flex; justify-content:space-between; gap:16px; align-items:center; margin-bottom:14px; }
+    h1,h2,h3,p { margin:0; }
+    h1 { font-size:22px; font-weight:600; }
+    h2 { font-size:16px; font-weight:600; }
+    .subtitle,.muted { color:var(--muted); }
+    .subtitle { margin-top:4px; font-size:13px; }
+    .status { display:flex; flex-wrap:wrap; gap:8px; }
+    .badge { padding:6px 10px; border-radius:999px; background:var(--soft); font-size:12px; }
+    .badge.active { color:#171717; background:var(--gold); }
+    .roster { display:grid; grid-template-columns:repeat(12,1fr); gap:7px; margin-bottom:14px; }
+    .seat { position:relative; min-height:58px; padding:8px 4px; border:1px solid var(--line); border-radius:10px; background:var(--panel); text-align:center; }
+    .seat strong { display:block; font-size:16px; }
+    .seat small { color:var(--muted); font-size:11px; }
+    .seat.user { border-color:var(--purple); }
+    .seat.sheriff::after { content:"警长"; position:absolute; top:-7px; right:-4px; padding:2px 5px; border-radius:6px; color:#171717; background:var(--gold); font-size:9px; }
+    .seat.dead { opacity:.38; filter:grayscale(1); }
+    .layout { display:grid; grid-template-columns:minmax(0,1.05fr) minmax(340px,.95fr); gap:14px; }
+    .panel { border:1px solid var(--line); border-radius:14px; background:var(--panel); }
+    .panel-head { display:flex; justify-content:space-between; gap:12px; align-items:center; padding:13px 15px; border-bottom:1px solid var(--line); }
+    .current { min-height:305px; display:grid; place-items:center; padding:26px; text-align:center; }
+    .avatar { width:68px; height:68px; display:grid; place-items:center; margin:auto; border-radius:50%; color:var(--gold); background:var(--soft); font-size:24px; font-weight:600; }
+    .speech { max-width:680px; margin:16px auto 0; line-height:1.75; text-align:left; }
+    .controls { display:flex; flex-wrap:wrap; gap:10px; padding:14px 15px; border-top:1px solid var(--line); }
+    .controls > * { flex:1; }
+    textarea { width:100%; min-height:110px; resize:vertical; padding:12px; border:1px solid var(--line); border-radius:10px; color:var(--text); background:var(--bg); }
+    select { min-height:42px; padding:0 10px; border:1px solid var(--line); border-radius:10px; color:var(--text); background:var(--soft); }
+    .private { margin-top:14px; padding:14px 15px; border:1px solid color-mix(in srgb,var(--purple) 50%,var(--line)); border-radius:14px; background:color-mix(in srgb,var(--purple) 10%,var(--panel)); }
+    .private-row { display:flex; justify-content:space-between; gap:12px; align-items:center; }
+    .role { color:var(--purple); font-weight:600; }
+    .history-tools { display:flex; gap:8px; }
+    .history-tools button { min-height:34px; padding:0 10px; font-size:12px; }
+    .timeline { max-height:620px; overflow:auto; padding:8px 15px 15px; }
+    .event { display:grid; grid-template-columns:38px 1fr; gap:10px; padding:11px 0; border-bottom:1px solid var(--line); }
+    .event:last-child { border-bottom:0; }
+    .event-id { color:var(--muted); font-size:11px; padding-top:2px; }
+    .event-title { display:flex; flex-wrap:wrap; gap:7px; align-items:center; margin-bottom:5px; font-size:12px; }
+    .event-title strong { color:var(--gold); }
+    .event-text { line-height:1.6; font-size:14px; white-space:pre-wrap; }
+    .empty { padding:40px; color:var(--muted); text-align:center; }
+    .error { min-height:22px; margin-top:9px; color:var(--red); font-size:13px; }
+    @media (max-width:900px) { .roster{grid-template-columns:repeat(6,1fr)} .layout{grid-template-columns:1fr} .timeline{max-height:none} }
+    @media (max-width:520px) { .app{padding:10px} header{align-items:flex-start;flex-direction:column} .roster{grid-template-columns:repeat(4,1fr)} .current{padding:20px 14px} .controls{flex-direction:column} }
+  </style>
+</head>
+<body>
+  <main class="app">
+    <header>
+      <div><h1>十二人狼人杀</h1><p class="subtitle">预言家 · 女巫 · 骑士 · 守卫 · 狼美人</p></div>
+      <div class="status" id="status"></div>
+    </header>
+    <section class="roster" id="roster" aria-label="玩家状态"></section>
+    <div class="layout">
+      <div>
+        <section class="panel">
+          <div class="panel-head"><h2 id="stage-title">当前发言</h2><span class="muted" id="order-hint"></span></div>
+          <div class="current" id="current"></div>
+          <div class="controls" id="controls"></div>
+        </section>
+        <section class="private">
+          <div class="private-row"><div><span class="muted">仅你可见</span><div class="role">1号 · 骑士</div></div><span id="duel-state"></span></div>
+          <div class="controls" id="duel-controls"></div>
+        </section>
+        <p class="error" id="error" role="alert"></p>
+      </div>
+      <section class="panel">
+        <div class="panel-head"><div><h2>完整记录</h2><span class="muted" id="history-count"></span></div><div class="history-tools"><button data-filter="all">全部</button><button data-filter="speech">只看发言</button><button id="export">导出</button></div></div>
+        <div class="timeline" id="timeline"></div>
+      </section>
+    </div>
+  </main>
+  <script>
+    let state = null;
+    let filter = 'all';
+    const $ = id => document.getElementById(id);
+    const labels = {speech:'发言',system:'法官',vote:'投票',death:'出局',ability:'技能',sheriff:'警长竞选',night:'夜晚'};
+    async function api(payload) {
+      $('error').textContent = '';
+      const response = await fetch('/api/action', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || '操作失败');
+      state = data; render();
+    }
+    function roster() {
+      $('roster').innerHTML = state.players.map(p => `<div class="seat ${p.alive?'':'dead'} ${p.user?'user':''} ${p.sheriff?'sheriff':''}"><strong>${p.seat}</strong><small>${p.user?'你':p.alive?'存活':'已出局'}${p.role?' · '+p.role:''}</small></div>`).join('');
+    }
+    function latestSpeech(seat) {
+      return [...state.history].reverse().find(e => e.kind==='speech' && e.speaker===seat && e.day===state.day);
+    }
+    function stage() {
+      const speaker = state.current_speaker;
+      $('stage-title').textContent = state.phase==='speech' ? '当前发言' : state.phase==='vote' ? '放逐投票' : state.phase==='night' ? '夜晚阶段' : '游戏结束';
+      $('order-hint').textContent = state.phase==='speech' ? `第${state.speech_index+1}/${state.speech_order.length}位` : '';
+      if (state.phase==='speech' && speaker) {
+        const event = latestSpeech(speaker);
+        $('current').innerHTML = `<div><div class="avatar">${speaker}</div><h2 style="margin-top:12px">${speaker}号玩家</h2><p class="subtitle">第${state.day}天 · ${speaker===1?'等待你的发言':'发言已记录'}</p>${event?`<p class="speech">“${event.text}”</p>`:'<p class="speech muted">轮到你发言，请在下方输入。</p>'}</div>`;
+      } else if (state.phase==='vote') {
+        $('current').innerHTML = '<div><div class="avatar">票</div><h2 style="margin-top:12px">请选择放逐目标</h2><p class="speech muted">警长拥有1.5票。所有存活玩家参加白天放逐投票。</p></div>';
+      } else if (state.phase==='night') {
+        $('current').innerHTML = '<div><div class="avatar">夜</div><h2 style="margin-top:12px">天黑请闭眼</h2><p class="speech muted">你的骑士没有夜间行动。点击下方按钮，由法官依次结算其他角色。</p></div>';
+      } else {
+        $('current').innerHTML = `<div><div class="avatar">终</div><h2 style="margin-top:12px">${state.winner}胜利</h2><p class="speech muted">完整身份与所有发言已保留在记录中，可导出复盘。</p></div>`;
+      }
+    }
+    function optionList(excludeUser=false) {
+      return state.players.filter(p => p.alive && (!excludeUser || p.seat!==1)).map(p => `<option value="${p.seat}">${p.seat}号</option>`).join('');
+    }
+    function controls() {
+      const box = $('controls');
+      const speaker = state.current_speaker;
+      if (state.phase==='speech' && speaker===1 && state.players[0].alive) {
+        box.innerHTML = '<div><textarea id="speech-input" maxlength="2000" placeholder="输入你的公开发言……"></textarea><button class="primary" id="speak" style="width:100%;margin-top:8px">发表并轮到2号</button></div>';
+        $('speak').onclick = () => run({action:'speak',text:$('speech-input').value});
+      } else if (state.phase==='speech') {
+        const idx = state.speech_index + 1;
+        const next = idx < state.speech_order.length ? `${state.speech_order[idx]}号发言` : '进入投票';
+        box.innerHTML = `<button class="primary" id="advance">下一步：${next}</button>`;
+        $('advance').onclick = () => run({action:'advance'});
+      } else if (state.phase==='vote') {
+        box.innerHTML = `<select id="vote-target"><option value="abstain">弃票</option>${optionList()}</select><button class="primary" id="vote">确认投票并结算</button>`;
+        $('vote').onclick = () => run({action:'vote',target:$('vote-target').value});
+      } else if (state.phase==='night') {
+        box.innerHTML = '<button class="primary" id="night">结算夜晚</button>';
+        $('night').onclick = () => run({action:'night'});
+      } else box.innerHTML = '';
+    }
+    function duel() {
+      const available = state.private.duel_available && state.phase==='speech';
+      $('duel-state').textContent = state.private.duel_available ? '决斗尚未使用' : '决斗已失效或已使用';
+      $('duel-controls').innerHTML = available ? `<select id="duel-target">${optionList(true)}</select><button class="danger" id="duel">翻牌决斗</button>` : '';
+      if (available) $('duel').onclick = () => { if(confirm(`确认决斗${$('duel-target').value}号？技能整局仅一次。`)) run({action:'duel',target:$('duel-target').value}); };
+    }
+    function history() {
+      const events = filter==='speech' ? state.history.filter(e=>e.kind==='speech') : state.history;
+      $('history-count').textContent = ` · ${events.length}条`;
+      $('timeline').innerHTML = events.length ? [...events].reverse().map(e => `<article class="event"><div class="event-id">#${e.id}</div><div><div class="event-title"><strong>${e.speaker?e.speaker+'号':labels[e.kind]||'记录'}</strong><span>第${e.day}天 · ${labels[e.phase]||labels[e.kind]||e.phase}</span></div><div class="event-text">${escapeHtml(e.text)}</div></div></article>`).join('') : '<div class="empty">暂无记录</div>';
+    }
+    function escapeHtml(text) { const d=document.createElement('div'); d.textContent=text; return d.innerHTML; }
+    function render() {
+      $('status').innerHTML = `<span class="badge">第${state.day}天</span><span class="badge">存活 ${state.alive.length}/12</span><span class="badge">警长 ${state.sheriff?state.sheriff+'号':'无'}</span><span class="badge active">${state.phase==='speech'?(state.current_speaker+'号发言'):state.phase==='vote'?'投票':state.phase==='night'?'夜晚':'结束'}</span>`;
+      roster(); stage(); controls(); duel(); history();
+    }
+    async function run(payload) { try { await api(payload); } catch(e) { $('error').textContent=e.message; } }
+    document.querySelectorAll('[data-filter]').forEach(b => b.onclick=()=>{filter=b.dataset.filter;history();});
+    $('export').onclick = () => { const blob=new Blob([JSON.stringify(state.history,null,2)],{type:'application/json'}); const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download='werewolf-history.json'; a.click(); URL.revokeObjectURL(a.href); };
+    fetch('/api/state').then(r=>r.json()).then(data=>{state=data;render();}).catch(e=>$('error').textContent='无法连接本地游戏服务：'+e.message);
+  </script>
+</body>
+</html>

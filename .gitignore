@@ -59,6 +59,7 @@ test*.py
 # Game results
 game_results/
 game_stats/
+.panel_game_state.json
 
 # Config with sensitive data - ignore actual configs, keep examples
 config/ai_config.json

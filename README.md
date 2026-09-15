@@ -113,6 +113,14 @@ cp config/role_config.example.json config/role_config.json
 
 ### 4. 运行游戏
 
+#### 本地交互面板（1名真人 + 11名电脑玩家）
+
+```bash
+python panel_game.py
+```
+
+打开 `http://127.0.0.1:8765`。面板会逐个展示发言、保留完整历史，并在轮到1号时接受真人发言；游戏进度会自动保存在本地。使用 `python panel_game.py --reset` 可重置面板对局。
+
 #### 方式一：自动选择（推荐）
 
 ```bash
