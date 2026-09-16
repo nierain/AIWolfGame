@@ -44,11 +44,25 @@ def load_state() -> Dict[str, Any]:
     try:
         state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
         if state.get("schema") == 2:
-            state.setdefault("sheriff_candidates", [])
-            state.setdefault("sheriff_election_players", [])
-            state.setdefault("vote_summary", {})
-            state.setdefault("last_duel", None)
-            changed = migrate_legacy_postgame(state)
+            changed = False
+            defaults = {
+                "sheriff_candidates": [], "sheriff_election_players": [],
+                "vote_summary": {}, "last_duel": None,
+                "postgame_impressions": {}, "mvp_votes": {}, "mvp_result": {},
+            }
+            for key, value in defaults.items():
+                if key not in state:
+                    state[key] = value
+                    changed = True
+            if state.get("phase") == "post_game_speech":
+                prompt = ("赛后身份已经全部公开，请先以最终身份表为准，说说自己的感想、关键判断和整局思路；"
+                          "再自然评价2至4位给你留下特别印象的选手，说明具体原因。")
+                if state.get("phase_data", {}).get("prompt") != prompt:
+                    state["phase_data"]["prompt"] = prompt
+                    if state.get("pending"):
+                        state["pending"]["prompt"] = prompt
+                    changed = True
+            changed = migrate_legacy_postgame(state) or changed
             changed = ensure_profiles(state, load_memory_store(memory_file())) or changed
             if changed:
                 save_state(state)

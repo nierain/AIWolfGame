@@ -30,7 +30,7 @@ ROOT = Path(__file__).resolve().parents[1]
 BRIDGE = ROOT / "codex_bridge"
 
 SPEECH_ACTIONS = {"speech", "pk_speech", "campaign_speech", "last_words", "postgame_speech", "wolf_chat"}
-REQUIRED_TARGET = {"wolf_kill", "charm", "guard", "divine", "sheriff_recommend"}
+REQUIRED_TARGET = {"wolf_kill", "charm", "guard", "divine", "sheriff_recommend", "mvp_vote"}
 OPTIONAL_TARGET = {"vote", "witch_poison", "sheriff_transfer", "knight_decide"}
 BOOL_ACTIONS = {"campaign": "join", "withdraw": "withdraw", "witch_save": "use"}
 
@@ -103,6 +103,9 @@ def format_task(payload: Dict[str, Any]) -> str:
                 if p.get("revealed_role")}
     if revealed:
         lines.append(f"已亮身份 {revealed}")
+    if view.get("winner"):
+        final_roles = {p["seat"]: p.get("role") for p in view.get("players", [])}
+        lines.append(f"最终身份 {final_roles}")
 
     if private:
         lines.append("PRIVATE")
@@ -167,6 +170,12 @@ def validate(intent: Dict[str, Any], request: Dict[str, Any]) -> None:
     if action in SPEECH_ACTIONS and not str(intent.get("text") or "").strip():
         if action != "wolf_chat":
             raise SystemExit("该行动必须提供发言文本")
+    if action == "mvp_vote" and not str(intent.get("text") or "").strip():
+        raise SystemExit("MVP票选必须提供简短理由")
+    if action == "postgame_speech":
+        impressions = intent.get("player_impressions")
+        if not isinstance(impressions, list) or not 2 <= len(impressions) <= 4:
+            raise SystemExit("赛后复盘必须在 player_impressions 中评价2至4位选手")
     field = BOOL_ACTIONS.get(action)
     if field and not isinstance(intent.get(field), bool):
         raise SystemExit(f"{action} 需要布尔字段 {field}")
@@ -264,7 +273,8 @@ def cmd_intent_schema(args: argparse.Namespace) -> int:
     request = payload["request"]
     action = request["action"]
     fields: Dict[str, Any] = {"action": action, "target": None, "text": None,
-                              "join": None, "withdraw": None, "use": None, "direction": None}
+                              "join": None, "withdraw": None, "use": None, "direction": None,
+                              "player_impressions": None}
     _out(json.dumps({
         "request_action": action,
         "allowed_targets": request.get("allowed_targets", []),

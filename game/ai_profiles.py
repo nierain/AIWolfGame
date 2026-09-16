@@ -43,7 +43,7 @@ PROFILE_TEMPLATES = [
 
 def default_memory_store() -> Dict[str, Any]:
     return {
-        "schema": 1,
+        "schema": 2,
         "archived_game_ids": [],
         "profiles": {
             profile["id"]: {
@@ -169,6 +169,33 @@ def _won(role: str, winner: str) -> bool:
     return (winner == "狼人阵营") == is_wolf
 
 
+def _player_impressions(state: Dict[str, Any], seat: int) -> list:
+    impressions = []
+    for item in state.get("postgame_impressions", {}).get(str(seat), [])[:4]:
+        target = int(item.get("seat", 0))
+        if target not in range(1, 13) or target == seat:
+            continue
+        target_profile = state.get("ai_profiles", {}).get(str(target))
+        impressions.append({
+            "seat": target,
+            "profile_id": target_profile.get("id") if target_profile else None,
+            "name": target_profile.get("name") if target_profile else HUMAN_DISPLAY_NAME,
+            "impression": str(item.get("impression", ""))[:180],
+        })
+    ballot = state.get("mvp_votes", {}).get(str(seat), {})
+    if not impressions and ballot:
+        target = int(ballot.get("target", 0))
+        target_profile = state.get("ai_profiles", {}).get(str(target))
+        if target in range(1, 13) and target != seat:
+            impressions.append({
+                "seat": target,
+                "profile_id": target_profile.get("id") if target_profile else None,
+                "name": target_profile.get("name") if target_profile else HUMAN_DISPLAY_NAME,
+                "impression": str(ballot.get("reason", ""))[:180],
+            })
+    return impressions
+
+
 def archive_completed_game(state: Dict[str, Any], memory_path: Path, archive_root: Path) -> bool:
     """Archive one completed game and update each identity's compact memory once."""
     if state.get("phase") != "game_over" or not state.get("winner"):
@@ -179,15 +206,49 @@ def archive_completed_game(state: Dict[str, Any], memory_path: Path, archive_roo
         return False
     store = load_memory_store(memory_path)
     if game_id in store["archived_game_ids"]:
-        return False
+        changed = False
+        archive_path = archive_root / f"{game_id}.json"
+        if state.get("mvp_result") and archive_path.exists():
+            try:
+                archive = json.loads(archive_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError, TypeError):
+                archive = {}
+            if archive.get("mvp_result") != state["mvp_result"]:
+                archive["schema"] = 2
+                archive["history"] = deepcopy(state.get("history", []))
+                archive["mvp_result"] = deepcopy(state["mvp_result"])
+                _write_json_atomic(archive_path, archive)
+                changed = True
+        for seat, profile in state.get("ai_profiles", {}).items():
+            persistent = store["profiles"][profile["id"]]
+            for entry in persistent.get("recent_games", []):
+                if entry.get("game_id") != game_id:
+                    continue
+                ballot = state.get("mvp_votes", {}).get(str(seat), {})
+                updates = {
+                    "player_impressions": _player_impressions(state, int(seat)),
+                    "mvp_vote": ({
+                        "target": ballot.get("target"),
+                        "reason": str(ballot.get("reason", ""))[:160],
+                    } if ballot else None),
+                }
+                for key, value in updates.items():
+                    if entry.get(key) != value:
+                        entry[key] = value
+                        changed = True
+                break
+        if changed:
+            _write_json_atomic(memory_path, store)
+        return changed
 
     archive = {
-        "schema": 1,
+        "schema": 2,
         "game_id": game_id,
         "day": state.get("day", 0),
         "winner": state["winner"],
         "players": [],
         "history": deepcopy(state.get("history", [])),
+        "mvp_result": deepcopy(state.get("mvp_result", {})),
     }
     for seat in range(1, 13):
         profile = state.get("ai_profiles", {}).get(str(seat))
@@ -214,6 +275,8 @@ def archive_completed_game(state: Dict[str, Any], memory_path: Path, archive_roo
              and event.get("speaker") == int(seat)),
             "本局没有留下赛后复盘。",
         )
+        impressions = _player_impressions(state, int(seat))
+        ballot = state.get("mvp_votes", {}).get(str(seat), {})
         entry = {
             "game_id": game_id,
             "seat": int(seat),
@@ -221,6 +284,11 @@ def archive_completed_game(state: Dict[str, Any], memory_path: Path, archive_roo
             "won": won,
             "days": state.get("day", 0),
             "reflection": str(reflection)[:900],
+            "player_impressions": impressions,
+            "mvp_vote": {
+                "target": ballot.get("target"),
+                "reason": str(ballot.get("reason", ""))[:160],
+            } if ballot else None,
         }
         persistent["games_played"] = int(persistent.get("games_played", 0)) + 1
         persistent["wins"] = int(persistent.get("wins", 0)) + int(won)
@@ -228,10 +296,14 @@ def archive_completed_game(state: Dict[str, Any], memory_path: Path, archive_roo
         recent = list(persistent.get("recent_games", []))
         recent.append(entry)
         persistent["recent_games"] = recent[-5:]
+        impression_summary = "；".join(
+            f"对{item['name']}的印象：{item['impression']}" for item in impressions
+        )
         persistent["summary"] = (
             f"已参加{persistent['games_played']}局，{persistent['wins']}胜"
             f"{persistent['losses']}负。最近一局以{role}身份"
             f"{'获胜' if won else '落败'}；自己的复盘：{entry['reflection']}"
+            + (f"；{impression_summary}" if impression_summary else "")
         )[:1400]
 
     store["archived_game_ids"].append(game_id)

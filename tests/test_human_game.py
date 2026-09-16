@@ -79,6 +79,8 @@ def human_intent(state):
         return {"action": action, "direction": "forward"}
     if action == "sheriff_transfer":
         return {"action": action, "target": targets[0] if targets else None}
+    if action == "mvp_vote":
+        return {"action": action, "target": targets[0], "text": "关键轮次贡献最直接。"}
     return {"action": action, "target": targets[0] if targets else None}
 
 
@@ -130,6 +132,28 @@ class HumanGameTests(unittest.TestCase):
                               if event.get("phase") == "post_game_speech"]), 1)
         self.assertEqual(len([event for event in restored_again["history"]
                               if event.get("phase") == "post_game_speech"]), 1)
+
+    def test_completed_debrief_without_mvp_returns_to_mvp_vote(self):
+        state = create_game(4, "villager", seed=32)
+        state["winner"] = "好人阵营"
+        state["phase"] = "game_over"
+        state["pending"] = None
+        state["phase_data"] = {}
+        state["history"].append({
+            "id": 999, "day": 3, "phase": "post_game_speech", "kind": "speech",
+            "speaker": 1, "text": "本局复盘已经完成。",
+        })
+
+        with tempfile.TemporaryDirectory() as directory:
+            save_path = Path(directory) / "completed-without-mvp.json"
+            save_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+            with patch.object(panel_game, "STATE_FILE", save_path):
+                restored = panel_game.load_state()
+
+        self.assertEqual(restored["phase"], "mvp_vote")
+        self.assertEqual(restored["pending"]["action"], "mvp_vote")
+        self.assertEqual(restored["pending"]["actor"], state["human_seat"])
+        self.assertIn(state["human_seat"], restored["pending"]["allowed_targets"])
 
     def test_standard_board_and_debug_roles(self):
         self.assertEqual(len(ROLE_DECK), 12)
@@ -214,19 +238,31 @@ class HumanGameTests(unittest.TestCase):
             "id": 999, "day": 2, "phase": "post_game_speech", "kind": "speech",
             "speaker": 2, "text": "我这一局站边太快，下局会先核对票型。",
         })
+        state["postgame_impressions"]["2"] = [
+            {"seat": 1, "impression": "发言谨慎，关键轮次能及时修正站边。"}
+        ]
+        state["mvp_votes"]["2"] = {"target": 1, "reason": "关键轮次贡献稳定。"}
+        state["mvp_result"] = {"counts": {"1": 1}, "winners": [1], "votes": []}
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             memory_path = root / ".aiwolf_long_term_memory.json"
             archive_dir = root / "game_archives"
             self.assertTrue(archive_completed_game(state, memory_path, archive_dir))
             self.assertFalse(archive_completed_game(state, memory_path, archive_dir))
+            state["mvp_votes"]["2"] = {"target": 1, "reason": "补投理由。"}
+            state["mvp_result"] = {"counts": {"1": 1}, "winners": [1], "votes": []}
+            self.assertTrue(archive_completed_game(state, memory_path, archive_dir))
             store = load_memory_store(memory_path)
             profile_id = state["ai_profiles"]["2"]["id"]
             persistent = store["profiles"][profile_id]
             self.assertEqual(persistent["games_played"], 1)
             self.assertIn("核对票型", persistent["summary"])
+            self.assertEqual(persistent["recent_games"][-1]["player_impressions"][0]["seat"], 1)
+            self.assertEqual(persistent["recent_games"][-1]["mvp_vote"]["target"], 1)
+            self.assertEqual(persistent["recent_games"][-1]["mvp_vote"]["reason"], "补投理由。")
             archive = json.loads((archive_dir / f"{state['game_id']}.json").read_text("utf-8"))
             self.assertEqual(archive["winner"], "狼人阵营")
+            self.assertEqual(archive["mvp_result"]["winners"], [1])
             self.assertNotIn("wolf_chat", archive)
 
     def test_every_night_role_waits_for_human(self):
@@ -630,12 +666,28 @@ class HumanGameTests(unittest.TestCase):
         revealed = get_visible_state(state, 2)
         self.assertTrue(all(player["role"] for player in revealed["players"]))
 
+        drive(state, stop=lambda current: current["phase"] == "mvp_vote", limit=30)
+
+        self.assertEqual(state["pending"]["action"], "mvp_vote")
+        self.assertIn(state["human_seat"], state["pending"]["allowed_targets"])
+
+        engine = HumanGameEngine(BuiltinAIProvider())
+        engine.submit_human(state, human_intent(state))
+        self.assertEqual(state["phase"], "mvp_vote")
+        self.assertEqual(len(state["phase_data"]["votes"]), 1)
+        self.assertNotEqual(state["pending"]["actor"], state["human_seat"])
+        engine.advance_ai(state)
+        self.assertEqual(len(state["phase_data"]["votes"]), 2)
+
         drive(state, limit=30)
 
         debriefs = [event for event in state["history"]
                     if event["kind"] == "speech" and event["phase"] == "post_game_speech"]
         self.assertEqual(state["phase"], "game_over")
         self.assertEqual([event["speaker"] for event in debriefs], list(range(1, 13)))
+        self.assertEqual(len(state["mvp_votes"]), 12)
+        self.assertEqual(sum(state["mvp_result"]["counts"].values()), 12)
+        self.assertTrue(state["mvp_result"]["winners"])
         self.assertIsNone(state["pending"])
 
     def test_codex_bridge_task_contains_only_visible_state(self):

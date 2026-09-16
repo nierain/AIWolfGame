@@ -86,7 +86,15 @@ class BuiltinAIProvider(ActionProvider):
             text = prefix + (f"今晚我偏向刀{target}号，白天我会尽量和狼队拉开关系。" if target else "先听队友意见，我这轮可以做深水。")
             return {"action": action, "text": text}
         if action == "postgame_speech":
-            return {"action": action, "text": self._postgame_speech(visible_state, persona)}
+            text, impressions = self._postgame_speech(visible_state, persona)
+            return {"action": action, "text": text, "player_impressions": impressions}
+        if action == "mvp_vote":
+            target = self._pick_mvp(visible_state, targets, key)
+            return {
+                "action": action,
+                "target": target,
+                "text": f"我投给{target}号。他在关键轮次的判断和行动对最终胜负影响最直接。",
+            }
         if action in {"speech", "pk_speech", "campaign_speech", "last_words"}:
             return {"action": action, "text": self._speech(visible_state, action, persona)}
         if action == "sheriff_order":
@@ -178,7 +186,48 @@ class BuiltinAIProvider(ActionProvider):
             plan = "我的整体思路是先听发言找逻辑矛盾，再判断是否值得用唯一一次决斗验证身份"
         else:
             plan = "我的整体思路是只用公开发言和票型逐轮排坑，观察谁的立场前后不一致"
-        return f"我是{seat}号，底牌是{view['self']['role_label']}。{result}。{plan}。全局里我发言{speeches}次、投票{votes}次，复盘后最需要改进的是更早说明自己的判断依据。"
+        others = [player for player in view["players"] if player["seat"] != seat]
+        scores = self._performance_scores(view, [player["seat"] for player in others])
+        notable = sorted(
+            others, key=lambda player: (-scores.get(player["seat"], 0), player["seat"])
+        )[:3]
+        role_labels = {
+            "werewolf": "狼人", "wolf_beauty": "狼美人", "seer": "预言家",
+            "witch": "女巫", "knight": "骑士", "guard": "守卫", "villager": "平民",
+        }
+        impressions = [{
+            "seat": player["seat"],
+            "impression": f"{player['seat']}号以{role_labels.get(player.get('role'), '公开身份')}参与了关键轮次，判断和行动给我留下了较深印象。",
+        } for player in notable]
+        comments = "；".join(f"{item['seat']}号：{item['impression']}" for item in impressions)
+        text = (f"我是{seat}号，底牌是{view['self']['role_label']}。{result}。{plan}。"
+                f"全局里我发言{speeches}次、投票{votes}次，复盘后最需要改进的是更早说明自己的判断依据。"
+                f"本局特别印象是：{comments}")
+        return text, impressions
+
+    def _pick_mvp(self, view, targets, key):
+        scores = self._performance_scores(view, targets)
+        maximum = max(scores.values(), default=0)
+        finalists = [seat for seat, score in scores.items() if score == maximum]
+        return _stable_choice(sorted(finalists), *key)
+
+    def _performance_scores(self, view, targets):
+        scores = {int(target): 0 for target in targets}
+        roles = {int(player["seat"]): player.get("role") for player in view.get("players", [])}
+        winner = view.get("winner")
+        for seat, role in roles.items():
+            won = ((role in {"werewolf", "wolf_beauty"}) == (winner == "狼人阵营"))
+            if won and seat in scores:
+                scores[seat] += 2
+        for event in view.get("history", []):
+            speaker = event.get("speaker")
+            if speaker in scores and event.get("kind") in {"ability", "sheriff"}:
+                scores[speaker] += 3
+            if event.get("phase") == "post_game_speech":
+                text = str(event.get("text") or "")
+                for seat in scores:
+                    scores[seat] += min(text.count(f"{seat}号"), 2)
+        return scores
 
 
 class CodexFileProvider(ActionProvider):
@@ -247,8 +296,21 @@ class CodexCLIProvider(ActionProvider):
                     "type": ["string", "null"],
                     "enum": ["forward", "reverse", None],
                 },
+                "player_impressions": {
+                    "type": ["array", "null"],
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "seat": {"type": "integer", "minimum": 1, "maximum": 12},
+                            "impression": {"type": "string"},
+                        },
+                        "required": ["seat", "impression"],
+                        "additionalProperties": False,
+                    },
+                    "maxItems": 4,
+                },
             },
-            "required": ["action", "target", "text", "join", "withdraw", "use", "direction"],
+            "required": ["action", "target", "text", "join", "withdraw", "use", "direction", "player_impressions"],
             "additionalProperties": False,
         }
         payload = json.dumps(
@@ -309,16 +371,22 @@ class CodexCLIProvider(ActionProvider):
 
     @staticmethod
     def _prompt(action: str) -> str:
-        postgame = ("当前是赛后复盘，胜负已经确定且全部身份已公开。请结合完整公开历史、"
-                    "自己的身份与私有经历，真诚说明感想、关键判断、行动目的、成功或失误之处以及全局思路。"
+        postgame = ("当前是赛后复盘，胜负已经确定且全部身份已公开。players.role 是最终身份表，"
+                    "它比玩家在发言或遗言中的自称更可靠，必须先核对再复盘。请结合完整公开历史、"
+                    "自己的身份与私有经历，真诚说明感想、关键判断、行动目的、成功或失误之处以及全局思路；"
+                    "再挑选2至4位给你留下特别印象的其他选手，在发言中自然评价其具体表现，并把同样的压缩评价"
+                    "写入 player_impressions，每条不超过两句话。"
                     if action == "postgame_speech" else "")
+        mvp = ("当前是赛后MVP票选。全部身份已经公开，请以实际贡献和对胜负的影响为准公正投票，"
+               "可以投自己；target 填候选座位，text 用一到两句话概括可核对的理由，不要写长文。"
+               if action == "mvp_vote" else "")
         return f"""你正在扮演一局12人狼人杀中的一个真实玩家，现在需要完成动作 {action}。
 输入JSON中的 visible_state 是你唯一知道的局面；严禁猜测或寻找未提供的隐藏身份，严禁读取文件或使用工具。
-{postgame}
+{postgame}{mvp}
 结合公开发言、公开票型、你自己的身份/私有信息、历史立场、人格和策略认真判断。好人要分析发言与行为的一致性；狼人可以撒谎、悍跳、冲锋、倒钩或卖队友，但不要泄露狼队信息；狼人若在 private.wolf_chat 中看到队友已经安排战术，应优先执行该计划并在白天配合；神职要合理安排技能与信息公开时机。
 memory 中的人格、说话风格和跨局摘要属于你这个固定玩家本人，请自然延续经验与性格；过去对局中的身份和结论只可作为复盘经验，不能当成当前对局的隐藏信息。
 发言必须像中文狼人杀玩家，针对具体座位和已发生事件形成连贯逻辑；允许判断错误和合理改站边，但改站边时应解释原因。不要说自己是AI，不要用概率报告或模板化空话。
-只返回符合输出结构的行动JSON。没有使用的字段填 null。target 只能从 request.allowed_targets 中选择；允许放弃的动作可填 null。"""
+只返回符合输出结构的行动JSON。没有使用的字段填 null。target 只能从 request.allowed_targets 中选择；允许放弃的动作可填 null。除赛后复盘外 player_impressions 填 null。"""
 
     @staticmethod
     def _validate_intent(intent: Dict[str, Any], request: Dict[str, Any]) -> None:
@@ -326,7 +394,7 @@ memory 中的人格、说话风格和跨局摘要属于你这个固定玩家本�
         if intent.get("action") != action:
             raise ValueError("Codex 玩家返回了错误的动作类型，请重试。")
         allowed = request.get("allowed_targets", [])
-        required_target = {"wolf_kill", "charm", "guard", "divine", "sheriff_recommend"}
+        required_target = {"wolf_kill", "charm", "guard", "divine", "sheriff_recommend", "mvp_vote"}
         target_actions = required_target | {"vote", "witch_poison", "sheriff_transfer", "knight_decide"}
         if action in target_actions:
             target = intent.get("target")
@@ -336,6 +404,12 @@ memory 中的人格、说话风格和跨局摘要属于你这个固定玩家本�
                 raise ValueError("Codex 玩家选择了非法目标，请重试。")
         if action in {"speech", "pk_speech", "campaign_speech", "last_words", "postgame_speech"} and not str(intent.get("text") or "").strip():
             raise ValueError("Codex 玩家没有给出发言，请重试。")
+        if action == "mvp_vote" and not str(intent.get("text") or "").strip():
+            raise ValueError("Codex 玩家没有给出MVP票选理由，请重试。")
+        if action == "postgame_speech":
+            impressions = intent.get("player_impressions")
+            if not isinstance(impressions, list) or not 2 <= len(impressions) <= 4:
+                raise ValueError("赛后复盘需要评价2至4位特别选手")
         if action == "campaign" and not isinstance(intent.get("join"), bool):
             raise ValueError("Codex 玩家没有决定是否上警，请重试。")
         if action == "withdraw" and not isinstance(intent.get("withdraw"), bool):

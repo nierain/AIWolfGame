@@ -81,6 +81,7 @@ def create_game(human_seat: int = 0, debug_role: str = "random",
         "human_seat": chosen_seat, "winner": None, "pending": None,
         "phase_data": {}, "night": {}, "public_votes": {}, "last_exiled": None,
         "last_duel": None,
+        "postgame_impressions": {}, "mvp_votes": {}, "mvp_result": {},
         "sheriff_candidates": [],
         "sheriff_election_players": [], "vote_summary": {},
         "sheriff": None, "sheriff_badge": True, "badge_transfer_required": None,
@@ -220,6 +221,8 @@ def _targets_for(state: Dict[str, Any], actor: int, action: str) -> List[int]:
         return [seat for seat in alive if seat != actor]
     if action == "sheriff_transfer":
         return [seat for seat in alive if seat != actor]
+    if action == "mvp_vote":
+        return list(range(1, 13))
     return []
 
 
@@ -313,6 +316,34 @@ def _publish_simultaneous_result(state: Dict[str, Any]) -> None:
             "counts": {str(target): count for target, count in counts.items()},
             "abstain": abstain,
         }
+    elif data.get("action") == "mvp_vote":
+        votes = data.get("votes", {})
+        counts: Dict[int, int] = {}
+        records = []
+        for voter, ballot in sorted(votes.items(), key=lambda item: int(item[0])):
+            target = int(ballot["target"])
+            reason = str(ballot["reason"])
+            counts[target] = counts.get(target, 0) + 1
+            records.append({"voter": int(voter), "target": target, "reason": reason})
+            _add_event(
+                state, "mvp_vote", f"{voter}号投给{target}号：{reason}",
+                speaker=int(voter), phase="mvp_vote",
+            )
+        maximum = max(counts.values(), default=0)
+        winners = sorted(seat for seat, count in counts.items() if count == maximum)
+        state["mvp_votes"] = {str(item["voter"]): {
+            "target": item["target"], "reason": item["reason"]
+        } for item in records}
+        state["mvp_result"] = {
+            "counts": {str(seat): count for seat, count in sorted(counts.items())},
+            "winners": winners,
+            "votes": records,
+        }
+        names = "、".join(f"{seat}号" for seat in winners) or "无人"
+        _add_event(
+            state, "system", f"MVP票选结束：{names}以{maximum}票当选。",
+            phase="mvp_vote",
+        )
     data["published"] = True
 
 
@@ -396,9 +427,11 @@ def _queue_complete(state: Dict[str, Any]) -> None:
     elif phase == "day_revote":
         _finish_day_vote(state, revote=True)
     elif phase == "post_game_speech":
+        _start_mvp_vote(state)
+    elif phase == "mvp_vote":
         state["phase"] = "game_over"
         state["phase_data"] = {}
-        _add_event(state, "system", "赛后复盘结束，感谢所有玩家。", phase="game_over")
+        _add_event(state, "system", "赛后复盘与MVP票选结束，感谢所有玩家。", phase="game_over")
     else:
         raise RuntimeError(f"未处理的阶段结束: {phase}")
 
@@ -676,9 +709,22 @@ def _finish_if_needed(state: Dict[str, Any]) -> bool:
 def _start_postgame_debrief(state: Dict[str, Any]) -> None:
     _start_queue(
         state, "post_game_speech", "postgame_speech", range(1, 13),
-        prompt="赛后身份已经全部公开，请说说自己的感想、关键判断和整局思路。",
+        prompt=("赛后身份已经全部公开，请先以最终身份表为准，说说自己的感想、关键判断和整局思路；"
+                "再自然评价2至4位给你留下特别印象的选手，说明具体原因。"),
         include_dead=True,
     )
+
+
+def _start_mvp_vote(state: Dict[str, Any]) -> None:
+    state["mvp_votes"] = {}
+    state["mvp_result"] = {}
+    _start_queue(
+        state, "mvp_vote", "mvp_vote", range(1, 13),
+        prompt=("请公正投给本局表现最出色的一位玩家，可以投自己；"
+                "请用一到两句话简要说明可核对的具体理由。"),
+        simultaneous=True, include_dead=True,
+    )
+    state["phase_data"]["votes"] = {}
 
 
 def migrate_legacy_postgame(state: Dict[str, Any]) -> bool:
@@ -688,7 +734,11 @@ def migrate_legacy_postgame(state: Dict[str, Any]) -> bool:
     already_started = any(event.get("phase") == "post_game_speech"
                           for event in state.get("history", []))
     if already_started:
-        return False
+        if state.get("mvp_result"):
+            return False
+        _add_event(state, "system", "为本局补充全员MVP票选。", phase="mvp_vote")
+        _start_mvp_vote(state)
+        return True
     _add_event(state, "system", "检测到旧版结算存档，现进入赛后全员复盘。",
                phase="post_game_speech")
     _start_postgame_debrief(state)
@@ -792,6 +842,7 @@ def get_visible_state(state: Dict[str, Any], seat: int) -> Dict[str, Any]:
                          and not state.get("phase_data", {}).get("published")
                          else deepcopy(state.get("public_votes", {}))),
         "vote_summary": deepcopy(state.get("vote_summary", {})),
+        "mvp_result": deepcopy(state.get("mvp_result", {})),
         "private": private,
         "memory": compact_memory(state["ai_memories"].get(str(seat), {})),
         "winner": state["winner"],
@@ -844,6 +895,9 @@ class HumanGameEngine:
             self._drain_night_ai(state)
             return
         if state.get("phase_data", {}).get("simultaneous"):
+            if state["phase"] == "mvp_vote":
+                self._advance_one_ai(state)
+                return
             self._drain_simultaneous_ai(state)
             return
         if not self._advance_one_ai(state):
@@ -887,6 +941,7 @@ class HumanGameEngine:
             raise ValueError("当前没有轮到真人操作")
         self._apply(state, state["human_seat"], intent)
         if (state.get("pending") and state.get("phase_data", {}).get("simultaneous")
+                and state["phase"] != "mvp_vote"
                 and state["pending"]["actor"] != state["human_seat"]):
             self._drain_simultaneous_ai(state)
         elif (state.get("pending") and state["phase"].startswith("night_")
@@ -945,6 +1000,27 @@ class HumanGameEngine:
             display_phase = "sheriff" if state["phase"].startswith("sheriff") else state["phase"]
             _add_event(state, "speech", text, actor, phase=display_phase)
             _remember(state, actor, "speech", text)
+            if action == "postgame_speech" and actor != state["human_seat"]:
+                impressions = []
+                for item in intent.get("player_impressions") or []:
+                    try:
+                        target = int(item.get("seat"))
+                    except (AttributeError, TypeError, ValueError):
+                        continue
+                    impression = " ".join(str(item.get("impression") or "").split())[:180]
+                    if target in range(1, 13) and target != actor and impression:
+                        impressions.append({"seat": target, "impression": impression})
+                    if len(impressions) == 4:
+                        break
+                state.setdefault("postgame_impressions", {})[str(actor)] = impressions
+        elif action == "mvp_vote":
+            target = _target(intent, allowed)
+            reason = " ".join(str(intent.get("text") or "").split())[:160]
+            if not reason:
+                raise ValueError("MVP票选理由不能为空")
+            state["phase_data"].setdefault("votes", {})[str(actor)] = {
+                "target": target, "reason": reason,
+            }
         elif action == "withdraw":
             withdraws = bool(intent.get("withdraw"))
             state["phase_data"]["withdrawals"][str(actor)] = withdraws
