@@ -3,6 +3,7 @@ import time
 import logging
 from .roles import BaseRole, Werewolf, WolfBeauty, Villager, RoleType, Seer, Witch, Hunter, Guard, Idiot, WolfKing, Knight
 from .ai_players import create_ai_agent, BaseAIAgent
+from .visibility import get_legacy_visible_state
 import random
 import re
 from utils.logger import GameLogger, setup_logger
@@ -49,6 +50,14 @@ class GameController:
         
         debug_mode = config.get("debug", False)
         self.logger = setup_logger(debug=debug_mode)
+
+    def get_visible_state(self, player_id: str) -> Dict:
+        """为单个AI生成程序级隔离的可见状态。
+
+        角色对象仍由对应 Agent 自己持有；这里不会把完整身份表、其他角色的
+        夜间技能或带身份标签的内部统计交给模型。
+        """
+        return get_legacy_visible_state(self.game_state, self.players, player_id)
 
     def _random_assign_roles(self) -> Dict:
         """随机分配角色给玩家
@@ -373,7 +382,7 @@ class GameController:
             
             for wolf_id in wolves:
                 agent = self.ai_agents[wolf_id]
-                result = agent.discuss(self.game_state, speaker_name=self.players[wolf_id].name)
+                result = agent.discuss(self.get_visible_state(wolf_id), speaker_name=self.players[wolf_id].name)
                 
                 if result["type"] == "kill":
                     
@@ -416,7 +425,7 @@ class GameController:
         for beauty_id in wolf_beauties:
             beauty = self.players[beauty_id]
             beauty.charmed_player_id = None
-            result = self.ai_agents[beauty_id].charm(self.game_state)
+            result = self.ai_agents[beauty_id].charm(self.get_visible_state(beauty_id))
             target_id = result.get("target")
             if (target_id in self.players
                     and self.players[target_id].is_alive
@@ -440,7 +449,7 @@ class GameController:
             for seer_id in seers:
                 agent = self.ai_agents[seer_id]
                 seer = self.players[seer_id]
-                result = agent.check_player(self.game_state)
+                result = agent.check_player(self.get_visible_state(seer_id))
                 
                 if result["type"] == "check" and result["target"]:
                     target_id = result["target"]
@@ -488,7 +497,7 @@ class GameController:
                 for witch_id in witches:
                     agent = self.ai_agents[witch_id]
                     witch = self.players[witch_id]
-                    result = agent.use_potion(self.game_state, victim_id)
+                    result = agent.use_potion(self.get_visible_state(witch_id), victim_id)
                     
                     if result["type"] == "save":
                         # 检查是否可以使用解药
@@ -543,7 +552,7 @@ class GameController:
             for guard_id in guards:
                 agent = self.ai_agents[guard_id]
                 guard = self.players[guard_id]
-                result = agent.guard(self.game_state)
+                result = agent.guard(self.get_visible_state(guard_id))
                 
                 if result["type"] == "guard" and result["target"]:
                     target_id = result["target"]
@@ -625,7 +634,7 @@ class GameController:
                 if hunter.can_use_gun():
                     print(f"\n{hunter.name} 倒下的瞬间，抽出了猎枪...")
                     agent = self.ai_agents[player_id]
-                    result = agent.shoot(self.game_state)
+                    result = agent.shoot(self.get_visible_state(player_id))
                     
                     if result["type"] == "shoot" and result["target"]:
                         target_id = result["target"]
@@ -744,7 +753,7 @@ class GameController:
             if isinstance(role, Knight) and role.is_alive and role.can_challenge
         ]
         for knight_id, knight in knights:
-            result = self.ai_agents[knight_id].challenge(self.game_state)
+            result = self.ai_agents[knight_id].challenge(self.get_visible_state(knight_id))
             target_id = result.get("target") if result.get("will_challenge") else None
             if not target_id:
                 continue
@@ -798,7 +807,7 @@ class GameController:
             if not role.is_alive:
                 continue
             
-            result = agent.discuss(self.game_state, speaker_name=role.name)
+            result = agent.discuss(self.get_visible_state(player_id), speaker_name=role.name)
             
             # 处理不同类型的返回结果
             if isinstance(result, dict):
@@ -850,7 +859,7 @@ class GameController:
                 continue
             
             print(f"\n{role.name} 要补充发言吗？")
-            result = agent.discuss(self.game_state, speaker_name=role.name)
+            result = agent.discuss(self.get_visible_state(player_id), speaker_name=role.name)
             
             # 处理不同类型的返回结果
             if isinstance(result, dict):
@@ -996,7 +1005,7 @@ class GameController:
                 self.game_state["vote_context"] = vote_context
                 
                 # 获取投票目标和投票理由
-                vote_result = agent.vote(self.game_state)
+                vote_result = agent.vote(self.get_visible_state(player_id))
                 target_id = vote_result.get("target")
                 reason = vote_result.get("reason", "没有给出具体理由")
                 
@@ -1204,7 +1213,7 @@ class GameController:
                 if self.current_round == 1 or reason == "公投出局":
                     print(f"\n{player.name} 的遗言：")
                     agent = self.ai_agents[player_id]
-                    last_words = agent.last_words(self.game_state)
+                    last_words = agent.last_words(self.get_visible_state(player_id))
                     
                     
                     # 记录遗言
@@ -1312,7 +1321,7 @@ class GameController:
 注意：你现在的处境很危险，需要说服其他玩家不要投给你！
 """
             
-            result = agent.discuss(self.game_state, speaker_name=role.name)
+            result = agent.discuss(self.get_visible_state(player_id), speaker_name=role.name)
             
             # 处理不同类型的返回结果
             if isinstance(result, dict):
@@ -1379,7 +1388,7 @@ class GameController:
             
             # 生成竞选发言提示词
             prompt = self._generate_campaign_speech_prompt(role, candidates)
-            response = agent.ask_ai(prompt, None, self.game_state, speaker_name=role.name)
+            response = agent.ask_ai(prompt, None, self.get_visible_state(player_id), speaker_name=role.name)
             
             # print(response)
             
@@ -1437,7 +1446,7 @@ class GameController:
 请回复"竞选"或"不竞选"。
 """
         
-        response = agent.ask_ai(prompt, None, self.game_state, speaker_name=role.name, stream=False)
+        response = agent.ask_ai(prompt, None, self.get_visible_state(role.player_id), speaker_name=role.name, stream=False)
         if re.search(r'\b竞选\b', response) and not re.search(r'不竞选|不要竞选|放弃竞选', response):
             return True
         if "举手" in response:
@@ -1499,7 +1508,7 @@ class GameController:
 请回复"退水"或"坚持"。
 """
             
-            response = agent.ask_ai(prompt, None, self.game_state, speaker_name=role.name, stream=False)
+            response = agent.ask_ai(prompt, None, self.get_visible_state(player_id), speaker_name=role.name, stream=False)
             
             # 检查是否自爆
             if role.is_wolf() and not isinstance(role, WolfBeauty) and (("自爆" in response or "爆炸" in response) and not ("不自爆" in response or "不爆炸" in response)):
@@ -1557,7 +1566,7 @@ class GameController:
 3. 用"选择[玩家ID]"格式投票
 """
             
-            response = agent.ask_ai(prompt, None, self.game_state, speaker_name=role.name)
+            response = agent.ask_ai(prompt, None, self.get_visible_state(voter_id), speaker_name=role.name)
             target_id = agent._extract_target(response)
             
             if target_id in candidates:
@@ -1646,7 +1655,7 @@ class GameController:
 发言要清晰有力，展现警长的领导力！
 """
         
-        response = agent.ask_ai(prompt, None, self.game_state)
+        response = agent.ask_ai(prompt, None, self.get_visible_state(sheriff_id))
         # print(response)
         
         # 记录警徽流
@@ -1739,7 +1748,7 @@ class GameController:
 请决定是否自爆（回复"自爆"或"不自爆"）。
 """
             
-            response = agent.ask_ai(prompt, None, self.game_state)
+            response = agent.ask_ai(prompt, None, self.get_visible_state(wolf_id))
             
             if "不自爆" in response or "不爆炸" in response:
                 return False
@@ -1830,7 +1839,7 @@ class GameController:
 3. 用"选择[玩家ID]"格式指定目标
 """
         
-        response = agent.ask_ai(prompt, None, self.game_state)
+        response = agent.ask_ai(prompt, None, self.get_visible_state(wolf_id))
         target_id = agent._extract_target(response)
         
         if target_id and target_id in good_players:

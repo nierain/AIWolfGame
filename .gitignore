@@ -55,11 +55,17 @@ test_analysis/
 analysis/
 test_outputs/
 test*.py
+!tests/
+!tests/test_*.py
 
 # Game results
 game_results/
 game_stats/
 .panel_game_state.json
+.aiwolf_long_term_memory.json
+game_archives/
+codex_bridge/tasks/*.json
+codex_bridge/responses/*.json
 
 # Config with sensitive data - ignore actual configs, keep examples
 config/ai_config.json

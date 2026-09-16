@@ -5,160 +5,136 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>十二人狼人杀</title>
   <style>
-    :root { color-scheme: light dark; --bg:#121518; --panel:#1c2126; --soft:#272e34; --line:#3b444c; --text:#f3eee7; --muted:#aaa39a; --gold:#e1b94e; --purple:#bd99d8; --red:#e47d79; --green:#76bd8d; }
-    * { box-sizing:border-box; }
-    body { margin:0; background:var(--bg); color:var(--text); font-family:Inter,"Microsoft YaHei",system-ui,sans-serif; }
-    button,select,textarea { font:inherit; }
-    button { min-height:42px; padding:0 16px; border:1px solid var(--line); border-radius:10px; color:var(--text); background:var(--soft); cursor:pointer; }
-    button.primary { border-color:var(--gold); color:#171717; background:var(--gold); }
-    button.danger { border-color:var(--red); color:var(--red); background:transparent; }
-    button:disabled { cursor:default; opacity:.5; }
-    .app { max-width:1280px; margin:auto; padding:18px; }
-    header { display:flex; justify-content:space-between; gap:16px; align-items:center; margin-bottom:14px; }
-    h1,h2,h3,p { margin:0; }
-    h1 { font-size:22px; font-weight:600; }
-    h2 { font-size:16px; font-weight:600; }
-    .subtitle,.muted { color:var(--muted); }
-    .subtitle { margin-top:4px; font-size:13px; }
-    .status { display:flex; flex-wrap:wrap; gap:8px; }
-    .badge { padding:6px 10px; border-radius:999px; background:var(--soft); font-size:12px; }
-    .badge.active { color:#171717; background:var(--gold); }
-    .roster { display:grid; grid-template-columns:repeat(12,1fr); gap:7px; margin-bottom:14px; }
-    .seat { position:relative; min-height:58px; padding:8px 4px; border:1px solid var(--line); border-radius:10px; background:var(--panel); text-align:center; }
-    .seat strong { display:block; font-size:16px; }
-    .seat small { color:var(--muted); font-size:11px; }
-    .seat.user { border-color:var(--purple); }
-    .seat.sheriff::after { content:"警长"; position:absolute; top:-7px; right:-4px; padding:2px 5px; border-radius:6px; color:#171717; background:var(--gold); font-size:9px; }
-    .seat.dead { opacity:.38; filter:grayscale(1); }
-    .layout { display:grid; grid-template-columns:minmax(0,1.05fr) minmax(340px,.95fr); gap:14px; }
-    .panel { border:1px solid var(--line); border-radius:14px; background:var(--panel); }
-    .panel-head { display:flex; justify-content:space-between; gap:12px; align-items:center; padding:13px 15px; border-bottom:1px solid var(--line); }
-    .current { min-height:305px; display:grid; place-items:center; padding:26px; text-align:center; }
-    .avatar { width:68px; height:68px; display:grid; place-items:center; margin:auto; border-radius:50%; color:var(--gold); background:var(--soft); font-size:24px; font-weight:600; }
-    .speech { max-width:680px; margin:16px auto 0; line-height:1.75; text-align:left; }
-    .controls { display:flex; flex-wrap:wrap; gap:10px; padding:14px 15px; border-top:1px solid var(--line); }
-    .controls > * { flex:1; }
-    textarea { width:100%; min-height:110px; resize:vertical; padding:12px; border:1px solid var(--line); border-radius:10px; color:var(--text); background:var(--bg); }
-    select { min-height:42px; padding:0 10px; border:1px solid var(--line); border-radius:10px; color:var(--text); background:var(--soft); }
-    .private { margin-top:14px; padding:14px 15px; border:1px solid color-mix(in srgb,var(--purple) 50%,var(--line)); border-radius:14px; background:color-mix(in srgb,var(--purple) 10%,var(--panel)); }
-    .private-row { display:flex; justify-content:space-between; gap:12px; align-items:center; }
-    .role { color:var(--purple); font-weight:600; }
-    .history-tools { display:flex; gap:8px; }
-    .history-tools button { min-height:34px; padding:0 10px; font-size:12px; }
-    .timeline { max-height:620px; overflow:auto; padding:8px 15px 15px; }
-    .event { display:grid; grid-template-columns:38px 1fr; gap:10px; padding:11px 0; border-bottom:1px solid var(--line); }
-    .event:last-child { border-bottom:0; }
-    .event-id { color:var(--muted); font-size:11px; padding-top:2px; }
-    .event-title { display:flex; flex-wrap:wrap; gap:7px; align-items:center; margin-bottom:5px; font-size:12px; }
-    .event-title strong { color:var(--gold); }
-    .event-text { line-height:1.6; font-size:14px; white-space:pre-wrap; }
-    .empty { padding:40px; color:var(--muted); text-align:center; }
-    .error { min-height:22px; margin-top:9px; color:var(--red); font-size:13px; }
-    @media (max-width:900px) { .roster{grid-template-columns:repeat(6,1fr)} .layout{grid-template-columns:1fr} .timeline{max-height:none} }
-    @media (max-width:520px) { .app{padding:10px} header{align-items:flex-start;flex-direction:column} .roster{grid-template-columns:repeat(4,1fr)} .current{padding:20px 14px} .controls{flex-direction:column} }
+    :root{color-scheme:dark;--bg:#101419;--glow:#25232b;--panel:#1a2027;--soft:#252d36;--line:#38424d;--text:#f3eee7;--muted:#a8a199;--gold:#e0b64c;--purple:#b990d5;--red:#e47772;--green:#72ba89}
+    :root[data-theme="light"]{color-scheme:light;--bg:#f4f1eb;--glow:#fff8e8;--panel:#fffdfa;--soft:#ebe6dd;--line:#cfc7ba;--text:#28241f;--muted:#756e65;--gold:#b47a12;--purple:#76528f;--red:#b84c47;--green:#397a50}
+    *{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 50% 0,var(--glow) 0,var(--bg) 42%);color:var(--text);font-family:Inter,"Microsoft YaHei",system-ui,sans-serif;transition:background .2s,color .2s}button,select,textarea,input{font:inherit}button,select,input{min-height:42px}button{padding:0 16px;border:1px solid var(--line);border-radius:10px;color:var(--text);background:var(--soft);cursor:pointer}button.primary{border-color:var(--gold);color:#181818;background:var(--gold)}button.danger{border-color:var(--red);color:var(--red);background:transparent}button.ghost{background:transparent}button:disabled{cursor:default;opacity:.45}.theme-toggle{position:fixed;z-index:100;top:12px;right:12px;min-height:34px;padding:4px 11px;background:var(--panel);box-shadow:0 4px 16px #0003;font-size:12px}.app{max-width:1320px;margin:auto;padding:18px}header{display:flex;justify-content:space-between;gap:16px;align-items:center;margin:42px 0 14px}h1,h2,h3,p{margin:0}h1{font-size:22px}h2{font-size:16px}.muted{color:var(--muted)}.subtitle{margin-top:4px;color:var(--muted);font-size:13px}.header-tools,.status{display:flex;flex-wrap:wrap;gap:8px;align-items:center}.voice-toggle{min-height:30px;padding:4px 10px;font-size:12px}.badge{padding:6px 10px;border-radius:999px;background:var(--soft);font-size:12px}.badge.active{color:#171717;background:var(--gold)}.roster{display:grid;grid-template-columns:repeat(6,1fr);gap:8px;margin-bottom:10px}.seat{position:relative;min-height:126px;padding:9px 5px;border:1px solid var(--line);border-radius:11px;background:var(--panel);text-align:center}.seat strong{display:block;font-size:17px}.seat small{display:block;color:var(--muted);font-size:11px}.seat.user{border-color:var(--purple);box-shadow:inset 0 0 0 1px var(--purple)}.seat.current{border-color:var(--gold)}.seat.candidate{border-color:var(--green);box-shadow:inset 0 0 0 1px var(--green);background:color-mix(in srgb,var(--green) 9%,var(--panel))}.seat.candidate:before{content:"上警";position:absolute;top:-7px;left:-4px;padding:2px 5px;border-radius:6px;color:#101419;background:var(--green);font-size:9px}.seat.dead{opacity:.55;filter:grayscale(1)}.seat.sheriff:after{content:"警长";position:absolute;top:-7px;right:-4px;padding:2px 5px;border-radius:6px;color:#171717;background:var(--gold);font-size:9px}.seat-mark{width:calc(100% - 8px);min-height:28px;margin-top:6px;padding:0 4px;font-size:11px}.seat-speech{position:relative;margin-top:5px;font-size:11px;color:var(--muted)}.seat-speech summary{cursor:pointer;list-style:none}.seat-speech summary::-webkit-details-marker{display:none}.seat-speech-pop{position:absolute;z-index:20;top:22px;left:50%;width:240px;max-height:190px;overflow:auto;transform:translateX(-50%);padding:10px;border:1px solid var(--line);border-radius:9px;background:var(--bg);box-shadow:0 10px 28px #0009;text-align:left;line-height:1.55;color:var(--text)}.seat-speech-pop button{width:100%;min-height:30px;margin-top:8px;padding:2px 8px;font-size:11px}.vote-summary{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 14px;padding:10px 12px;border:1px solid var(--line);border-radius:11px;background:var(--panel)}.vote-summary strong{margin-right:4px;color:var(--gold)}.layout{display:grid;grid-template-columns:minmax(0,1.05fr) minmax(350px,.95fr);gap:14px}.panel,.private,.setup{border:1px solid var(--line);border-radius:14px;background:var(--panel)}.panel-head{display:flex;justify-content:space-between;gap:12px;align-items:center;padding:13px 15px;border-bottom:1px solid var(--line)}.current{min-height:260px;display:grid;place-items:center;padding:24px;text-align:center}.avatar{width:70px;height:70px;display:grid;place-items:center;margin:auto;border-radius:50%;color:var(--gold);background:var(--soft);font-size:24px;font-weight:700}.speech{max-width:700px;margin:15px auto 0;line-height:1.75;text-align:left}.controls{display:flex;flex-wrap:wrap;gap:10px;padding:14px 15px;border-top:1px solid var(--line)}.controls>*{flex:1}.controls .full{flex-basis:100%}textarea{width:100%;min-height:108px;resize:vertical;padding:12px;border:1px solid var(--line);border-radius:10px;color:var(--text);background:var(--bg)}select,input{padding:0 10px;border:1px solid var(--line);border-radius:10px;color:var(--text);background:var(--soft)}.private{margin-top:14px;padding:14px 15px;background:color-mix(in srgb,var(--purple) 8%,var(--panel))}.private-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.role{color:var(--purple);font-size:18px;font-weight:650}.chips{display:flex;flex-wrap:wrap;gap:7px;margin-top:10px}.chip{padding:5px 8px;border-radius:7px;background:var(--soft);font-size:12px}.wolf-chat{max-height:150px;overflow:auto;margin-top:10px;padding:10px;border-radius:9px;background:var(--bg);font-size:13px;line-height:1.6}.timeline{max-height:690px;overflow:auto;padding:8px 15px 15px}.event{display:grid;grid-template-columns:38px 1fr;gap:10px;padding:11px 0;border-bottom:1px solid var(--line)}.event-id{color:var(--muted);font-size:11px}.event-title{display:flex;gap:7px;margin-bottom:4px;font-size:12px}.event-title strong{color:var(--gold)}.event-text{line-height:1.6;font-size:14px;white-space:pre-wrap}.read-event{min-height:27px;margin-top:6px;padding:2px 8px;font-size:11px}.error{min-height:22px;margin-top:9px;color:var(--red);font-size:13px}.setup{max-width:680px;margin:8vh auto;padding:28px}.setup-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin:24px 0}.setup label{display:grid;gap:7px;color:var(--muted);font-size:13px}.setup button{width:100%}.offline-note{margin-top:22px;padding:18px;border:1px solid var(--gold);border-radius:12px;background:color-mix(in srgb,var(--gold) 8%,var(--panel));line-height:1.7}.offline-note code{display:block;margin:12px 0;padding:10px;border-radius:8px;background:var(--bg);color:var(--gold);user-select:all}.hidden{display:none!important}.waiting{color:var(--gold)}
+    .duel-overlay{position:fixed;z-index:1000;inset:0;display:grid;place-items:center;overflow:hidden;background:radial-gradient(circle,#371f22e8 0,#080a0df5 68%);opacity:0;transition:opacity .22s;pointer-events:auto}.duel-overlay.active{opacity:1}.duel-arena{position:relative;width:min(720px,94vw);height:min(420px,72vh)}.duel-title{position:absolute;top:0;left:0;right:0;text-align:center;color:var(--gold);font-size:clamp(22px,4vw,38px);font-weight:800;letter-spacing:.18em;text-shadow:0 0 22px #e0b64c88}.duel-card{position:absolute;top:27%;width:150px;height:210px;display:grid;place-items:center;border:3px solid var(--gold);border-radius:15px;background:linear-gradient(145deg,#27313c,#12171d);box-shadow:0 12px 35px #000c,0 0 26px #e0b64c33;text-align:center;transition:left .9s cubic-bezier(.2,.85,.25,1),right .9s cubic-bezier(.2,.85,.25,1),transform .9s cubic-bezier(.2,.85,.25,1),opacity .28s,filter .28s}.duel-card strong{display:block;color:var(--gold);font-size:26px}.duel-card span{display:block;margin-top:8px;font-size:18px}.duel-card.knight{left:3%;transform:rotate(-7deg)}.duel-card.target{right:3%;transform:rotate(7deg);border-color:var(--red)}.duel-card.target strong{color:var(--red)}.duel-overlay.active .duel-card.knight{left:50%;transform:translateX(-108%) rotate(-2deg)}.duel-overlay.active .duel-card.target{right:50%;transform:translateX(108%) rotate(2deg)}.duel-overlay.impact .duel-arena:after{content:"⚔";position:absolute;z-index:5;left:50%;top:48%;transform:translate(-50%,-50%) scale(1.6);color:#fff;font-size:54px;text-shadow:0 0 28px var(--gold);animation:duelFlash .35s ease-out}.duel-card.shattered{opacity:0;filter:brightness(3) blur(5px)}.duel-shards{position:absolute;z-index:8;top:27%;width:150px;height:210px;pointer-events:none}.duel-shards.knight-loses{left:calc(50% - 162px)}.duel-shards.target-loses{left:calc(50% + 12px)}.duel-shards i{position:absolute;left:var(--x);top:var(--y);width:42px;height:54px;border:1px solid var(--gold);background:linear-gradient(145deg,#596675,#171e25);clip-path:polygon(50% 0,100% 30%,78% 100%,8% 75%,0 20%);animation:duelShard .72s ease-out forwards}.duel-result{position:absolute;left:0;right:0;bottom:2%;text-align:center;font-size:21px;font-weight:700;opacity:0;transform:translateY(12px);transition:.3s}.duel-overlay.impact .duel-result{opacity:1;transform:none}@keyframes duelFlash{0%{opacity:0;transform:translate(-50%,-50%) scale(.2)}45%{opacity:1}100%{opacity:0;transform:translate(-50%,-50%) scale(2.4)}}@keyframes duelShard{to{opacity:0;transform:translate(var(--dx),var(--dy)) rotate(var(--rot)) scale(.45)}}@media(prefers-reduced-motion:reduce){.duel-card,.duel-overlay,.duel-result{transition-duration:.01ms}.duel-shards i{animation-duration:.01ms}}
+    @media(min-width:1000px){.roster{grid-template-columns:repeat(12,1fr)}}@media(max-width:850px){.layout{grid-template-columns:1fr}.timeline{max-height:none}}@media(max-width:560px){.app{padding:10px}header{align-items:flex-start;flex-direction:column}.roster{grid-template-columns:repeat(4,1fr)}.setup-grid,.private-grid{grid-template-columns:1fr}.controls{flex-direction:column}.duel-card{width:120px;height:168px}.duel-shards{width:120px;height:168px}.duel-shards.knight-loses{left:calc(50% - 132px)}}
+    .seat{min-height:142px;padding:12px 5px 9px}.seat-number{position:absolute;top:7px;left:7px;padding:2px 6px;border:1px solid var(--line);border-radius:6px;background:var(--soft);font-size:11px;font-weight:750}.seat-portrait{width:52px;height:52px;min-height:0;margin:0 auto 5px;padding:0;border:0;border-radius:50%;background:transparent}.seat-portrait:hover .seat-avatar{border-color:var(--gold);transform:scale(1.04)}.seat-avatar{width:52px;height:52px;display:block;margin:0;border:2px solid var(--line);border-radius:50%;object-fit:cover;background:var(--soft);transition:.16s}.seat-avatar-placeholder{display:grid;place-items:center;color:var(--purple);font-weight:700}.seat .seat-name{display:block;min-height:17px;color:var(--text);font-size:13px;font-weight:650}.identity-plate{display:inline-flex;max-width:72px;min-height:22px;align-items:center;justify-content:center;margin-top:5px;padding:2px 7px;overflow:hidden;border:1px solid var(--line);border-radius:999px;background:var(--soft);color:var(--muted);font-size:10px;text-overflow:ellipsis;white-space:nowrap}.identity-plate.known{border-color:var(--purple);color:var(--purple)}.speech-jump{position:absolute;right:7px;bottom:7px;width:28px;height:28px;min-height:0;padding:0;border-radius:50%;font-size:13px}.speech-jump:disabled{opacity:.2}.seat.candidate:before{top:7px;right:7px;left:auto}.seat.sheriff:after{top:30px;right:7px}.actor-avatar{width:70px;height:70px;display:block;margin:auto;border:3px solid var(--gold);border-radius:50%;object-fit:cover;background:var(--soft)}.event.focus-event{margin:0 -8px;padding:11px 8px;border-radius:8px;background:color-mix(in srgb,var(--gold) 14%,transparent);box-shadow:inset 3px 0 var(--gold)}.marker-dialog{width:min(390px,calc(100vw - 28px));padding:18px;border:1px solid var(--line);border-radius:14px;color:var(--text);background:var(--panel);box-shadow:0 20px 60px #000a}.marker-dialog::backdrop{background:#0009}.marker-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin:16px 0}.marker-grid button{min-height:36px;padding:4px 6px;font-size:12px}.marker-grid button.active{border-color:var(--gold);color:#171717;background:var(--gold)}.marker-dialog-actions{display:flex;justify-content:flex-end}
   </style>
 </head>
 <body>
+  <button class="theme-toggle" id="theme-toggle">☀ 切换浅色</button>
   <main class="app">
-    <header>
-      <div><h1>十二人狼人杀</h1><p class="subtitle">预言家 · 女巫 · 骑士 · 守卫 · 狼美人</p></div>
-      <div class="status" id="status"></div>
-    </header>
-    <section class="roster" id="roster" aria-label="玩家状态"></section>
-    <div class="layout">
-      <div>
-        <section class="panel">
-          <div class="panel-head"><h2 id="stage-title">当前发言</h2><span class="muted" id="order-hint"></span></div>
-          <div class="current" id="current"></div>
-          <div class="controls" id="controls"></div>
-        </section>
-        <section class="private">
-          <div class="private-row"><div><span class="muted">仅你可见</span><div class="role">1号 · 骑士</div></div><span id="duel-state"></span></div>
-          <div class="controls" id="duel-controls"></div>
-        </section>
-        <p class="error" id="error" role="alert"></p>
+    <section class="setup" id="setup">
+      <h1>开始一局真正的单人狼人杀</h1>
+      <p class="subtitle">12人预女骑守 + 狼美人 · 1名真人 + 11名电脑玩家</p>
+      <div id="setup-form">
+        <div class="setup-grid">
+          <label>真人座位<select id="human-seat"><option value="0">随机座位</option></select></label>
+          <label>身份<select id="debug-role"><option value="random">随机身份（正式游戏）</option><option value="villager">平民（调试）</option><option value="werewolf">狼人（调试）</option><option value="wolf_beauty">狼美人（调试）</option><option value="seer">预言家（调试）</option><option value="witch">女巫（调试）</option><option value="guard">守卫（调试）</option><option value="knight">骑士（调试）</option></select></label>
+          <label>狼人自刀<select id="wolf-self-kill"><option value="allow">允许（可刀到狼，含自刀）</option><option value="deny">禁止（只能刀好人）</option></select></label>
+        </div>
+        <button class="primary" id="start">开始游戏</button>
       </div>
-      <section class="panel">
-        <div class="panel-head"><div><h2>完整记录</h2><span class="muted" id="history-count"></span></div><div class="history-tools"><button data-filter="all">全部</button><button data-filter="speech">只看发言</button><button id="export">导出</button></div></div>
-        <div class="timeline" id="timeline"></div>
-      </section>
+      <div class="offline-note hidden" id="offline-help">
+        <h2>打开方式不对</h2>
+        <p>你现在打开的是网页文件，游戏服务还没有连接。请回到项目根目录，双击 <strong>启动狼人杀.bat</strong>；或者先运行下面的命令：</p>
+        <code>.venv\Scripts\python.exe panel_game.py --open-browser</code>
+      </div>
+      <p class="error" id="setup-error"></p>
+    </section>
+    <div id="game" class="hidden">
+      <header><div><h1>十二人狼人杀</h1><p class="subtitle">预言家 · 女巫 · 骑士 · 守卫 · 狼美人</p></div><div class="header-tools"><button class="ghost voice-toggle" id="voice-toggle">🔊 自动朗读：开</button><div class="status" id="status"></div></div></header>
+      <section class="roster" id="roster"></section>
+      <section class="vote-summary hidden" id="vote-summary"></section>
+      <div class="layout">
+        <div>
+          <section class="panel">
+            <div class="panel-head"><h2 id="stage-title">当前阶段</h2><span class="muted" id="actor-hint"></span></div>
+            <div class="current" id="current"></div>
+            <div class="controls" id="controls"></div>
+          </section>
+          <section class="private"><div class="private-grid"><div><span class="muted">仅你可见</span><div class="role" id="role"></div></div><div id="ability"></div></div><div class="chips" id="private-chips"></div><div id="wolf-chat-wrap" class="hidden"><h3 style="margin-top:12px;font-size:14px">狼人夜聊</h3><div class="wolf-chat" id="wolf-chat"></div></div><div class="controls hidden" id="duel-controls"></div></section>
+          <p class="error" id="error" role="alert"></p>
+        </div>
+        <section class="panel"><div class="panel-head"><div><h2>公共记录</h2><span class="muted" id="history-count"></span></div><div><button class="ghost" id="export">导出记录</button><button class="ghost" id="new-game">新游戏</button></div></div><div class="timeline" id="timeline"></div></section>
+      </div>
     </div>
   </main>
+  <dialog class="marker-dialog" id="marker-dialog">
+    <h3 id="marker-dialog-title">标记身份</h3>
+    <p class="subtitle">只保存在你的浏览器中，不会影响真实身份或让其他玩家看到。</p>
+    <div class="marker-grid" id="marker-grid"></div>
+    <div class="marker-dialog-actions"><button class="ghost" id="marker-dialog-close">取消</button></div>
+  </dialog>
+  <div class="duel-overlay hidden" id="duel-overlay" role="status" aria-live="assertive">
+    <div class="duel-arena" id="duel-arena"></div>
+  </div>
   <script>
-    let state = null;
-    let filter = 'all';
-    const $ = id => document.getElementById(id);
-    const labels = {speech:'发言',system:'法官',vote:'投票',death:'出局',ability:'技能',sheriff:'警长竞选',night:'夜晚'};
-    async function api(payload) {
-      $('error').textContent = '';
-      const response = await fetch('/api/action', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || '操作失败');
-      state = data; render();
+    let state=null,busy=false,lastSpokenEvent=0,bridgeTimer=null;
+    let voiceEnabled=localStorage.getItem('aiwolf_voice')!=='off';
+    let theme=localStorage.getItem('aiwolf_theme')||'dark';
+    const $=id=>document.getElementById(id);
+    const phaseLabels={night_wolf_chat:'狼人夜聊',night_wolf_vote:'狼人刀人',night_beauty:'狼美人魅惑',night_guard:'守卫行动',night_seer:'预言家查验',night_witch_save:'女巫解药',night_witch_poison:'女巫毒药',sheriff_campaign:'警长上警',sheriff_speech:'警上发言',sheriff_withdraw:'退水',sheriff_vote:'警长投票',sheriff_pk_speech:'警长PK发言',sheriff_pk_vote:'警长PK复投',day_order:'警长安排发言',day_speech:'白天发言',sheriff_recommend:'警长归票',day_vote:'放逐投票',day_pk_speech:'放逐PK发言',day_revote:'放逐PK复投',last_words:'遗言',sheriff_transfer:'警徽处理',post_game_speech:'赛后复盘',game_over:'游戏结束'};
+    const roleLabels={werewolf:'狼人',wolf_beauty:'狼美人',seer:'预言家',witch:'女巫',knight:'骑士',guard:'守卫',villager:'平民'};
+    const actionLabels={night_wait:'夜间行动',simultaneous_wait:'等待同时公布',wolf_chat:'狼人夜聊',wolf_kill:'选择刀口',charm:'选择魅惑',guard:'选择守护',divine:'选择查验',witch_save:'决定是否救人',witch_poison:'决定是否毒人',campaign:'决定是否上警',campaign_speech:'警上发言',withdraw:'决定是否退水',vote:'投票',pk_speech:'PK发言',last_words:'发表遗言',postgame_speech:'赛后复盘',sheriff_order:'安排发言顺序',sheriff_recommend:'警长归票',sheriff_transfer:'移交或撕毁警徽',speech:'公开发言'};
+    const markerOptions=['','好人','狼人','神职','平民','预言家','女巫','骑士','守卫','狼美人','待观察'];
+    for(let i=1;i<=12;i++)$('human-seat').insertAdjacentHTML('beforeend',`<option value="${i}">${i}号</option>`);
+    function esc(value){const d=document.createElement('div');d.textContent=String(value??'');return d.innerHTML}
+    function applyTheme(){document.documentElement.dataset.theme=theme;$('theme-toggle').textContent=theme==='light'?'🌙 切换深色':'☀ 切换浅色'}
+    function markerKey(){return `aiwolf_private_marks_${state?.game_id||'setup'}`}
+    function loadMarkers(){try{return JSON.parse(localStorage.getItem(markerKey())||'{}')}catch{return {}}}
+    function saveMarker(seat,value){const marks=loadMarkers();if(value)marks[seat]=value;else delete marks[seat];localStorage.setItem(markerKey(),JSON.stringify(marks))}
+    function speakText(text){if(!('speechSynthesis'in window))return;window.speechSynthesis.cancel();const utterance=new SpeechSynthesisUtterance(text);utterance.lang='zh-CN';utterance.rate=1;window.speechSynthesis.speak(utterance)}
+    function updateVoiceButton(){const button=$('voice-toggle');if(!button)return;const available='speechSynthesis'in window;button.disabled=!available;button.textContent=available?`🔊 自动朗读：${voiceEnabled?'开':'关'}`:'浏览器不支持朗读'}
+    function maybeAutoSpeak(){const event=latestSpeech();if(!event)return;if(!lastSpokenEvent){lastSpokenEvent=event.id;return}if(event.id>lastSpokenEvent){lastSpokenEvent=event.id;if(voiceEnabled)speakText(`${event.speaker||'法官'}号：${event.text}`)}}
+    function playDuelAnimation(duel){
+      const overlay=$('duel-overlay'),arena=$('duel-arena');
+      const targetResult=duel.success?`${duel.target}号败北，狼人牌碎裂！`:`${duel.knight}号决斗失败，骑士牌碎裂！`;
+      arena.innerHTML=`<div class="duel-title">骑士决斗</div><div class="duel-card knight" data-seat="${duel.knight}"><div><strong>骑士</strong><span>${duel.knight}号</span></div></div><div class="duel-card target" data-seat="${duel.target}"><div><strong>决斗目标</strong><span>${duel.target}号</span></div></div><div class="duel-shards ${duel.loser===duel.knight?'knight-loses':'target-loses'}"></div><div class="duel-result">${targetResult}</div>`;
+      overlay.className='duel-overlay';
+      const reduced=matchMedia('(prefers-reduced-motion: reduce)').matches,impactDelay=reduced?80:950,totalDelay=reduced?600:2350;
+      requestAnimationFrame(()=>requestAnimationFrame(()=>overlay.classList.add('active')));
+      return new Promise(resolve=>{
+        setTimeout(()=>{
+          overlay.classList.add('impact');
+          arena.querySelector(`.duel-card[data-seat="${duel.loser}"]`).classList.add('shattered');
+          const vectors=[[-75,-110,-95],[-15,-125,-40],[55,-105,70],[-95,-20,-125],[85,-10,110],[-70,80,-65],[0,105,35],[75,85,95],[110,40,150]];
+          arena.querySelector('.duel-shards').innerHTML=vectors.map((v,i)=>`<i style="--x:${(i%3)*48}px;--y:${Math.floor(i/3)*67}px;--dx:${v[0]}px;--dy:${v[1]}px;--rot:${v[2]}deg"></i>`).join('');
+        },impactDelay);
+        setTimeout(()=>{overlay.classList.remove('active');setTimeout(()=>{overlay.className='duel-overlay hidden';arena.innerHTML='';resolve()},250)},totalDelay);
+      });
     }
-    function roster() {
-      $('roster').innerHTML = state.players.map(p => `<div class="seat ${p.alive?'':'dead'} ${p.user?'user':''} ${p.sheriff?'sheriff':''}"><strong>${p.seat}</strong><small>${p.user?'你':p.alive?'存活':'已出局'}${p.role?' · '+p.role:''}</small></div>`).join('');
+    async function api(payload){$('error').textContent='';const previousDuel=state?.last_duel?.event_id||0;const response=await fetch('/api/action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const data=await response.json();if(!response.ok)throw new Error(data.error||'操作失败');state=data;render();if(data.last_duel&&data.last_duel.event_id!==previousDuel)await playDuelAnimation(data.last_duel)}
+    async function run(payload){if(busy)return;busy=true;const controls=[...document.querySelectorAll('button,select,textarea')];controls.forEach(x=>x.disabled=true);if(state&&state.phase!=='setup')$('actor-hint').textContent='电脑玩家正在思考，请稍候……';try{await api(payload)}catch(e){$('error').textContent=e.message;$('setup-error').textContent=e.message}finally{busy=false;controls.forEach(x=>x.disabled=false);if(state)render()}}
+    function scheduleBridgePoll(){clearTimeout(bridgeTimer);const p=state&&state.pending;if(!state||state.phase==='game_over')return;if(p&&p.waiting_external&&!state.can_human_act)bridgeTimer=setTimeout(()=>{if(!busy)run({action:'continue'})},1400)}
+    function render(){const setup=state.phase==='setup';$('setup').classList.toggle('hidden',!setup);$('game').classList.toggle('hidden',setup);if(setup)return;renderStatus();renderRoster();renderVoteSummary();renderStage();renderPrivate();renderHistory();updateVoiceButton();maybeAutoSpeak();scheduleBridgePoll()}
+    function renderStatus(){const alive=state.players.filter(p=>p.alive).length;$('status').innerHTML=`<span class="badge">第${state.day||1}天</span><span class="badge">存活 ${alive}/12</span><span class="badge">警长 ${state.sheriff?state.sheriff+'号':'无'}</span><span class="badge active">${phaseLabels[state.phase]||state.phase}</span>`}
+    function currentRoundSpeeches(seat){return (state.history||[]).filter(e=>e.kind==='speech'&&e.speaker===seat&&(state.winner?e.phase==='post_game_speech':e.day===state.day))}
+    function playerAt(seat){return state.players.find(player=>player.seat===Number(seat))}
+    function stageAvatar(player,fallback){return player?.avatar?`<img class="actor-avatar" src="${esc(player.avatar)}" alt="${esc(player.name)}头像">`:`<div class="avatar">${esc(fallback)}</div>`}
+    function openMarkerPicker(seat){
+      const dialog=$('marker-dialog'),player=playerAt(seat),marks=loadMarkers(),current=marks[seat]||'';
+      $('marker-dialog-title').textContent=`标记 ${seat}号 · ${player?.name||'玩家'}`;
+      $('marker-grid').innerHTML=markerOptions.map(value=>`<button type="button" class="${current===value?'active':''}" data-value="${esc(value)}">${esc(value||'未知')}</button>`).join('');
+      $('marker-grid').querySelectorAll('button').forEach(button=>button.onclick=()=>{saveMarker(seat,button.dataset.value);dialog.close();renderRoster()});
+      dialog.showModal();
     }
-    function latestSpeech(seat) {
-      return [...state.history].reverse().find(e => e.kind==='speech' && e.speaker===seat && e.day===state.day);
+    function jumpToSpeech(eventId){const event=document.getElementById(`event-${eventId}`);if(!event)return;event.scrollIntoView({behavior:'smooth',block:'center'});event.classList.add('focus-event');setTimeout(()=>event.classList.remove('focus-event'),1800)}
+    function renderRoster(){
+      const actor=state.pending?.actor,marks=loadMarkers();
+      $('roster').innerHTML=state.players.map(p=>{
+        const speeches=currentRoundSpeeches(p.seat),latest=speeches.at(-1);
+        const knownRole=p.role||p.revealed_role,identity=knownRole?roleLabels[knownRole]:(marks[p.seat]||'未知');
+        const portrait=p.avatar?`<img class="seat-avatar" src="${esc(p.avatar)}" alt="${esc(p.name)}头像" loading="lazy">`:'<span class="seat-avatar seat-avatar-placeholder">你</span>';
+        return `<div class="seat ${p.alive?'':'dead'} ${p.is_human?'user':''} ${p.sheriff?'sheriff':''} ${p.campaigning?'candidate':''} ${p.seat===actor?'current':''}"><span class="seat-number">${p.seat}号</span><button type="button" class="seat-portrait" data-seat="${p.seat}" title="点击修改私人身份标记">${portrait}</button><strong class="seat-name">${esc(p.name||'玩家')}${p.is_human?'（你）':''}</strong><button type="button" class="identity-plate ${knownRole?'known':''}" data-seat="${p.seat}" title="点击修改私人身份标记；${knownRole?'当前优先显示已知真实身份':'当前显示你的私人标记'}">${esc(identity)}</button><button type="button" class="speech-jump" ${latest?`data-event="${latest.id}" title="查看本轮发言（${speeches.length}段）"`:'disabled'} aria-label="查看${p.seat}号本轮发言">💬</button></div>`
+      }).join('');
+      document.querySelectorAll('.seat-portrait,.identity-plate').forEach(button=>button.onclick=()=>openMarkerPicker(Number(button.dataset.seat)));
+      document.querySelectorAll('.speech-jump[data-event]').forEach(button=>button.onclick=()=>jumpToSpeech(Number(button.dataset.event)));
     }
-    function stage() {
-      const speaker = state.current_speaker;
-      $('stage-title').textContent = state.phase==='speech' ? '当前发言' : state.phase==='vote' ? '放逐投票' : state.phase==='night' ? '夜晚阶段' : '游戏结束';
-      $('order-hint').textContent = state.phase==='speech' ? `第${state.speech_index+1}/${state.speech_order.length}位` : '';
-      if (state.phase==='speech' && speaker) {
-        const event = latestSpeech(speaker);
-        $('current').innerHTML = `<div><div class="avatar">${speaker}</div><h2 style="margin-top:12px">${speaker}号玩家</h2><p class="subtitle">第${state.day}天 · ${speaker===1?'等待你的发言':'发言已记录'}</p>${event?`<p class="speech">“${event.text}”</p>`:'<p class="speech muted">轮到你发言，请在下方输入。</p>'}</div>`;
-      } else if (state.phase==='vote') {
-        $('current').innerHTML = '<div><div class="avatar">票</div><h2 style="margin-top:12px">请选择放逐目标</h2><p class="speech muted">警长拥有1.5票。所有存活玩家参加白天放逐投票。</p></div>';
-      } else if (state.phase==='night') {
-        $('current').innerHTML = '<div><div class="avatar">夜</div><h2 style="margin-top:12px">天黑请闭眼</h2><p class="speech muted">你的骑士没有夜间行动。点击下方按钮，由法官依次结算其他角色。</p></div>';
-      } else {
-        $('current').innerHTML = `<div><div class="avatar">终</div><h2 style="margin-top:12px">${state.winner}胜利</h2><p class="speech muted">完整身份与所有发言已保留在记录中，可导出复盘。</p></div>`;
-      }
-    }
-    function optionList(excludeUser=false) {
-      return state.players.filter(p => p.alive && (!excludeUser || p.seat!==1)).map(p => `<option value="${p.seat}">${p.seat}号</option>`).join('');
-    }
-    function controls() {
-      const box = $('controls');
-      const speaker = state.current_speaker;
-      if (state.phase==='speech' && speaker===1 && state.players[0].alive) {
-        box.innerHTML = '<div><textarea id="speech-input" maxlength="2000" placeholder="输入你的公开发言……"></textarea><button class="primary" id="speak" style="width:100%;margin-top:8px">发表并轮到2号</button></div>';
-        $('speak').onclick = () => run({action:'speak',text:$('speech-input').value});
-      } else if (state.phase==='speech') {
-        const idx = state.speech_index + 1;
-        const next = idx < state.speech_order.length ? `${state.speech_order[idx]}号发言` : '进入投票';
-        box.innerHTML = `<button class="primary" id="advance">下一步：${next}</button>`;
-        $('advance').onclick = () => run({action:'advance'});
-      } else if (state.phase==='vote') {
-        box.innerHTML = `<select id="vote-target"><option value="abstain">弃票</option>${optionList()}</select><button class="primary" id="vote">确认投票并结算</button>`;
-        $('vote').onclick = () => run({action:'vote',target:$('vote-target').value});
-      } else if (state.phase==='night') {
-        box.innerHTML = '<button class="primary" id="night">结算夜晚</button>';
-        $('night').onclick = () => run({action:'night'});
-      } else box.innerHTML = '';
-    }
-    function duel() {
-      const available = state.private.duel_available && state.phase==='speech';
-      $('duel-state').textContent = state.private.duel_available ? '决斗尚未使用' : '决斗已失效或已使用';
-      $('duel-controls').innerHTML = available ? `<select id="duel-target">${optionList(true)}</select><button class="danger" id="duel">翻牌决斗</button>` : '';
-      if (available) $('duel').onclick = () => { if(confirm(`确认决斗${$('duel-target').value}号？技能整局仅一次。`)) run({action:'duel',target:$('duel-target').value}); };
-    }
-    function history() {
-      const events = filter==='speech' ? state.history.filter(e=>e.kind==='speech') : state.history;
-      $('history-count').textContent = ` · ${events.length}条`;
-      $('timeline').innerHTML = events.length ? [...events].reverse().map(e => `<article class="event"><div class="event-id">#${e.id}</div><div><div class="event-title"><strong>${e.speaker?e.speaker+'号':labels[e.kind]||'记录'}</strong><span>第${e.day}天 · ${labels[e.phase]||labels[e.kind]||e.phase}</span></div><div class="event-text">${escapeHtml(e.text)}</div></div></article>`).join('') : '<div class="empty">暂无记录</div>';
-    }
-    function escapeHtml(text) { const d=document.createElement('div'); d.textContent=text; return d.innerHTML; }
-    function render() {
-      $('status').innerHTML = `<span class="badge">第${state.day}天</span><span class="badge">存活 ${state.alive.length}/12</span><span class="badge">警长 ${state.sheriff?state.sheriff+'号':'无'}</span><span class="badge active">${state.phase==='speech'?(state.current_speaker+'号发言'):state.phase==='vote'?'投票':state.phase==='night'?'夜晚':'结束'}</span>`;
-      roster(); stage(); controls(); duel(); history();
-    }
-    async function run(payload) { try { await api(payload); } catch(e) { $('error').textContent=e.message; } }
-    document.querySelectorAll('[data-filter]').forEach(b => b.onclick=()=>{filter=b.dataset.filter;history();});
-    $('export').onclick = () => { const blob=new Blob([JSON.stringify(state.history,null,2)],{type:'application/json'}); const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download='werewolf-history.json'; a.click(); URL.revokeObjectURL(a.href); };
-    fetch('/api/state').then(r=>r.json()).then(data=>{state=data;render();}).catch(e=>$('error').textContent='无法连接本地游戏服务：'+e.message);
+    function renderVoteSummary(){const box=$('vote-summary'),summary=state.vote_summary||{},counts=summary.counts||{};const entries=Object.entries(counts);box.classList.toggle('hidden',!entries.length&&!summary.abstain);if(entries.length||summary.abstain){const title=summary.phase?.startsWith('sheriff')?'警长竞选票型':'放逐票型';box.innerHTML=`<strong>${title}</strong>${entries.sort((a,b)=>Number(b[1])-Number(a[1])).map(([seat,count])=>`<span class="chip">${seat}号：${count}票</span>`).join('')}${summary.abstain?`<span class="chip">弃票：${summary.abstain}票</span>`:''}`}}
+    function latestSpeech(){return [...state.history].reverse().find(e=>e.kind==='speech')}
+    function renderStage(){const pending=state.pending,actorPlayer=pending?.actor?playerAt(pending.actor):null;$('stage-title').textContent=phaseLabels[state.phase]||'当前阶段';const actorName=pending?.actor?`${pending.actor}号 · ${actorPlayer?.name||'玩家'}`:'法官';$('actor-hint').textContent=pending?`${actorName} · ${actionLabels[pending.action]||pending.action}`:'';if(state.phase==='game_over'){$('current').innerHTML=`<div><div class="avatar">终</div><h2 style="margin-top:12px">${esc(state.winner)}胜利</h2><p class="speech muted">全部身份与赛后复盘均已公开，可以导出记录或开始新游戏。</p></div>`;$('controls').innerHTML='';return}const speech=latestSpeech();if(pending){const mine=state.can_human_act;const note=pending.waiting_external?'电脑玩家正在思考，写好行动后网页会自动推进……':mine?'游戏已暂停，等待你的决定。':'点击一次即可推进到下一次需要你操作的位置。';$('current').innerHTML=`<div>${stageAvatar(actorPlayer,pending.actor||'夜')}<h2 style="margin-top:12px">${esc(actorName)}</h2><p class="subtitle ${pending.waiting_external?'waiting':''}">${esc(note)}</p>${speech&&['speech','campaign_speech','pk_speech','last_words','postgame_speech'].includes(pending.action)?`<p class="speech">上一位：“${esc(speech.text)}”</p>`:''}<p class="speech muted">${esc(pending.prompt||'')}</p></div>`}else $('current').innerHTML='<div class="muted">法官正在结算……</div>';renderControls()}
+    function targetSelect(id,allowNone=false,label='选择玩家'){const opts=(state.pending?.allowed_targets||[]).map(x=>`<option value="${x}">${x}号</option>`).join('');return `<select id="${id}">${allowNone?'<option value="none">不使用 / 弃票 / 撕毁</option>':''}${opts}</select>`}
+    function renderControls(){const box=$('controls'),p=state.pending;if(!p){box.innerHTML='';return}if(!state.can_human_act){const who=p.actor?p.actor+'号':'其他玩家';const label=p.action==='simultaneous_wait'?'一次性完成并公布':p.action==='night_wait'?'一次性结算夜间':'继续：'+who+(actionLabels[p.action]||'行动');box.innerHTML=`<button class="primary" id="continue">${label}</button>`;$('continue').onclick=()=>run({action:'continue'});return}const a=p.action;if(['speech','campaign_speech','pk_speech','last_words','postgame_speech','wolf_chat'].includes(a)){const placeholder=a==='wolf_chat'?'输入给狼队友的夜间意见……':a==='last_words'?'输入你的遗言……':a==='postgame_speech'?'说说你的赛后感想、关键判断和整局思路……':'输入你的发言……';const label=a==='wolf_chat'?'发送':a==='last_words'?'遗言':a==='postgame_speech'?'复盘':'发言';box.innerHTML=`<div class="full"><textarea id="text" maxlength="2000" placeholder="${placeholder}"></textarea><button class="primary" id="submit-text" style="width:100%;margin-top:8px">确认${label}</button></div>`;$('submit-text').onclick=()=>run({action:a,text:$('text').value});return}if(a==='campaign'){box.innerHTML='<button id="no">不上警</button><button class="primary" id="yes">上警</button>';$('no').onclick=()=>run({action:a,join:false});$('yes').onclick=()=>run({action:a,join:true});return}if(a==='withdraw'){box.innerHTML='<button id="stay">坚持竞选</button><button class="danger" id="withdraw">退水</button>';$('stay').onclick=()=>run({action:a,withdraw:false});$('withdraw').onclick=()=>run({action:a,withdraw:true});return}if(a==='witch_save'){box.innerHTML='<button id="no-save">不救</button><button class="primary" id="save">使用解药</button>';$('no-save').onclick=()=>run({action:a,use:false});$('save').onclick=()=>run({action:a,use:true});return}if(a==='sheriff_order'){box.innerHTML='<button id="reverse">从上家开始逆序发言</button><button class="primary" id="forward">从下家开始顺序发言</button>';$('reverse').onclick=()=>run({action:a,direction:'reverse'});$('forward').onclick=()=>run({action:a,direction:'forward'});return}const optional=['vote','witch_poison','sheriff_transfer'].includes(a);box.innerHTML=`${targetSelect('target',optional)}<button class="primary" id="target-submit">确认${actionLabels[a]||'选择'}</button>`;$('target-submit').onclick=()=>run({action:a,target:$('target').value})}
+    function renderPrivate(){const self=state.self,priv=state.private||{};$('role').textContent=`${self.seat}号 · ${self.role_label}`;const chips=[];if(priv.wolf_teammates)chips.push('狼队友：'+(priv.wolf_teammates.join('、')||'无'));if(priv.seer_checks)priv.seer_checks.forEach(x=>chips.push(`第${x.day}夜：${x.seat}号是${x.is_wolf?'狼人':'好人'}`));if('medicine'in priv)chips.push(`解药：${priv.medicine?'有':'已用'}`,`毒药：${priv.poison?'有':'已用'}`);if('last_guarded'in priv)chips.push(`上夜守护：${priv.last_guarded?priv.last_guarded+'号':'无'}`);if('charmed_player'in priv)chips.push(`当前魅惑：${priv.charmed_player?priv.charmed_player+'号':'无'}`);$('private-chips').innerHTML=chips.map(x=>`<span class="chip">${esc(x)}</span>`).join('');$('ability').innerHTML=state.winner?'对局已结束，全部身份公开；即使出局也可以参与赛后复盘。':self.alive?'你仍在场，可以继续参与对应阶段。':'你已出局，只能观战。';const wolf=Array.isArray(priv.wolf_chat);$('wolf-chat-wrap').classList.toggle('hidden',!wolf);if(wolf)$('wolf-chat').innerHTML=priv.wolf_chat.length?priv.wolf_chat.map(x=>`<div><strong>${x.speaker}号：</strong>${esc(x.text)}</div>`).join(''):'今晚狼队还没有发言。';const duel=$('duel-controls');duel.classList.toggle('hidden',!state.can_duel);if(state.can_duel){const targets=state.players.filter(p=>p.alive&&p.seat!==self.seat).map(p=>`<option value="${p.seat}">${p.seat}号</option>`).join('');duel.innerHTML=`<select id="duel-target">${targets}</select><button class="danger" id="duel">发动骑士决斗</button>`;$('duel').onclick=()=>{if(confirm(`确认决斗${$('duel-target').value}号？整局只能使用一次。`))run({action:'knight_duel',target:$('duel-target').value})}}}
+    function renderHistory(){const events=state.history||[];$('history-count').textContent=` · ${events.length}条`;$('timeline').innerHTML=events.length?[...events].reverse().map(e=>`<article class="event" id="event-${e.id}"><div class="event-id">#${e.id}</div><div><div class="event-title"><strong>${e.speaker?e.speaker+'号':'法官'}</strong><span>第${e.day}天 · ${phaseLabels[e.phase]||e.kind}</span></div><div class="event-text">${esc(e.text)}</div>${e.kind==='speech'?`<button class="ghost read-event" data-event="${e.id}">🔊 朗读这段</button>`:''}</div></article>`).join(''):'<div class="muted" style="padding:40px;text-align:center">暂无记录</div>';document.querySelectorAll('.read-event').forEach(button=>button.onclick=()=>{const event=events.find(e=>e.id===Number(button.dataset.event));if(event)speakText(`${event.speaker||'法官'}号：${event.text}`)})}
+    $('theme-toggle').onclick=()=>{theme=theme==='light'?'dark':'light';localStorage.setItem('aiwolf_theme',theme);applyTheme()};applyTheme();
+    $('marker-dialog-close').onclick=()=>$('marker-dialog').close();
+    $('voice-toggle').onclick=()=>{voiceEnabled=!voiceEnabled;localStorage.setItem('aiwolf_voice',voiceEnabled?'on':'off');if(!voiceEnabled&&'speechSynthesis'in window)window.speechSynthesis.cancel();updateVoiceButton()};
+    $('start').onclick=()=>run({action:'start_game',human_seat:$('human-seat').value,debug_role:$('debug-role').value,wolf_self_kill:$('wolf-self-kill').value});$('new-game').onclick=()=>{if(confirm('返回设置页开始新游戏？当前存档会在开始新局后被替换。'))run({action:'new_game'})};$('export').onclick=()=>{const blob=new Blob([JSON.stringify(state.history,null,2)],{type:'application/json'}),a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='werewolf-history.json';a.click();URL.revokeObjectURL(a.href)};
+    if(location.protocol==='file:'){$('setup-form').classList.add('hidden');$('offline-help').classList.remove('hidden')}else{fetch('/api/state').then(r=>r.json()).then(data=>{state=data;render()}).catch(e=>{$('setup').classList.remove('hidden');$('setup-error').textContent='无法连接本地游戏服务：'+e.message})}
   </script>
 </body>
 </html>

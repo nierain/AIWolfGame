@@ -4,7 +4,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![OpenAI](https://img.shields.io/badge/OpenAI-Compatible-green.svg)](https://openai.com)
 
-一个基于大语言模型的多智能体狼人杀游戏模拟系统。通过配置不同的AI模型（如GPT-4、Claude、Gemini等）作为玩家，实现完整的狼人杀游戏流程，支持6-12人局，包含多种角色和规则配置。
+一个基于大语言模型的多智能体狼人杀项目，同时提供“1名真人 + 11名电脑玩家”的本地网页模式。项目保留原有全 AI 模拟器，并新增由确定性规则引擎裁决的预女骑守 + 狼美人 12 人局。
 
 ## 📋 目录
 
@@ -20,16 +20,22 @@
 ## ✨ 功能特点
 
 ### 🎮 游戏功能
+- **真人完整参与**：座位可随机或指定，发言、投票、警长竞选和身份技能均由真人操作
+- **正式12人板**：3狼人、狼美人、预言家、女巫、骑士、守卫、4平民，采用屠边规则
+- **刷新可恢复**：每次操作自动保存，浏览器刷新或程序重启后可继续
+- **真人固定形象**：真人玩家名为“牢雨”并使用独立头像，与电脑玩家一起显示在座位区和当前行动区
 - **多种角色支持**：狼人、村民、预言家、女巫、猎人、白痴、守卫、骑士等
 - **灵活人数配置**：支持6-12人局，每种人数提供多种预设配置
 - **完整游戏流程**：夜晚行动、白天讨论、投票处决、遗言发表
+- **赛后全员复盘**：胜负确定并公开身份后，12名玩家依次分享感想、关键判断和全局思路
 - **平票处理**：平票时进入补充发言阶段并重新投票
 - **MVP/SVP评选**：每局结束后评选胜方MVP和败方SVP
 
 ### 🤖 AI系统
 - **多模型支持**：GPT-4、Claude、Gemini、DeepSeek、Qwen、Grok、Llama、Kimi等
 - **角色认知**：AI清楚自己的角色身份和阵营目标
-- **记忆系统**：AI会记录游戏历史，进行推理分析
+- **固定玩家档案**：12名电脑玩家各自拥有固定姓名、头像、人格和说话风格；每局随机抽取11名，换座位时身份档案会一起移动
+- **压缩长期记忆**：完整对局本地封存，每名电脑玩家只把胜负统计、最近对局摘要和自己的赛后复盘带入下一局，避免重复消耗模型上下文
 - **智能投票**：支持弃票，API错误时自动处理
 
 ### 📊 统计功能
@@ -115,11 +121,41 @@ cp config/role_config.example.json config/role_config.json
 
 #### 本地交互面板（1名真人 + 11名电脑玩家）
 
+Windows 用户最简单的方式：直接双击项目根目录的 `启动狼人杀.bat`。它会使用本机已经登录的 Codex 控制 11 名电脑玩家，自动选择一个可用端口、启动游戏并打开正确网页。不要直接双击 `web/panel_game.html`，因为网页文件本身无法读取本地游戏状态。
+
 ```bash
-python panel_game.py
+python panel_game.py --open-browser --provider codex-cli
 ```
 
-打开 `http://127.0.0.1:8765`。面板会逐个展示发言、保留完整历史，并在轮到1号时接受真人发言；游戏进度会自动保存在本地。使用 `python panel_game.py --reset` 可重置面板对局。
+打开 `http://127.0.0.1:8765`。开始时可选择随机座位或指定 1~12 号；身份默认随机，也可在调试下拉框中指定。轮到真人的任何操作时游戏都会暂停，电脑发言则点击一次推进一位。
+
+`codex-cli` 模式复用 Codex CLI 当前的 ChatGPT 登录，不需要 11 个 API Key。每个电脑座位只会收到该玩家理论上可见的状态；模型只负责决定行动，游戏程序继续负责规则和结算。模型发言和决策需要等待一段时间，也会消耗当前 Codex 账户的使用额度。
+
+游戏进度会自动保存在 `.panel_game_state.json`；关闭程序后再次运行即可续局。返回设置页可开始新局，也可用以下命令强制回到设置页：
+
+```bash
+python panel_game.py --reset --provider codex-cli
+```
+
+如果 Codex 暂时不可用，可以切回反应快但逻辑简单的离线 AI：
+
+```bash
+python panel_game.py --open-browser --provider builtin
+```
+
+保留的实验性 Codex 文件桥接模式：
+
+```bash
+python panel_game.py --provider codex
+```
+
+该模式把每个 AI 的隔离视角任务写到 `codex_bridge/tasks/`，只读取 `codex_bridge/responses/` 中同名任务的 JSON 行动。它仍需要外部 Worker；正常试玩请使用 `codex-cli` 模式。
+
+运行回归测试：
+
+```bash
+python -m unittest discover -s tests -v
+```
 
 #### 方式一：自动选择（推荐）
 
@@ -197,7 +233,8 @@ python main.py --preset 8 --rounds 1 --debug
 
 | 角色 | 阵营 | 技能 | 说明 |
 |------|------|------|------|
-| 狼人 | 狼人 | 夜间杀人 | 每晚可以杀死一名玩家 |
+| 狼人 | 狼人 | 夜聊/杀人 | 与狼队讨论并共同选择刀口 |
+| 狼美人 | 狼人 | 魅惑 | 每晚魅惑一名非狼人；狼美人死亡时目标殉情 |
 | 预言家 | 好人 | 查验身份 | 每晚可以查验一名玩家是否是狼人 |
 | 女巫 | 好人 | 解药/毒药 | 可以使用解药救人或毒药杀人，各限一次 |
 | 猎人 | 好人 | 开枪 | 死亡时可以开枪带走一名玩家 |
@@ -209,7 +246,8 @@ python main.py --preset 8 --rounds 1 --debug
 ### 游戏流程
 
 1. **夜晚阶段**
-   - 狼人讨论并选择击杀目标
+   - 狼人夜聊并分别提交击杀目标，由法官统计
+   - 狼美人选择魅惑目标，守卫、预言家、女巫依次行动
    - 预言家查验玩家身份
    - 女巫选择是否使用解药或毒药
 
@@ -221,7 +259,9 @@ python main.py --preset 8 --rounds 1 --debug
 
 3. **游戏结束**
    - 狼人全部死亡：好人胜利
-   - 狼人数量 ≥ 好人数量：狼人胜利
+   - 神职全部死亡或平民全部死亡：狼人胜利（屠边）
+   - 胜负确定后公开全部身份，所有玩家（包括已出局玩家）依次完成赛后复盘
+   - 完成复盘后，对局写入本地 `game_archives/`，压缩后的个人经验写入 `.aiwolf_long_term_memory.json`
 
 ### MVP/SVP评分
 
@@ -244,6 +284,8 @@ AIWolfGame/
 │   └── preset_configs.json    # 预设游戏配置
 ├── game/                       # 游戏核心逻辑
 │   ├── __init__.py
+│   ├── human_game.py          # 真人对局的确定性规则引擎
+│   ├── ai_providers.py        # 可替换 AI/Codex 决策接口
 │   ├── game_controller.py     # 游戏控制器
 │   ├── ai_players.py          # AI玩家系统
 │   └── roles.py               # 角色定义
@@ -253,7 +295,10 @@ AIWolfGame/
 │   └── logger.py              # 日志系统
 ├── logs/                       # 日志目录（自动生成）
 ├── game_results/               # 游戏结果（自动生成）
-├── test_all.py                 # 测试脚本
+├── tests/                      # 真人对局回归测试
+├── AGENTS.md                  # 后续 Codex 开发约定
+├── PROJECT_CONTEXT.md         # 当前进度与下一步
+├── panel_game.py              # 本地网页服务
 ├── main.py                     # 主程序入口
 ├── requirements.txt            # 依赖列表
 ├── LICENSE                     # MIT许可证
