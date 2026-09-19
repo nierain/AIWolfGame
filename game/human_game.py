@@ -25,11 +25,26 @@ from .ai_profiles import (
 ROLE_LABELS = {
     "werewolf": "狼人", "wolf_beauty": "狼美人", "seer": "预言家",
     "witch": "女巫", "knight": "骑士", "guard": "守卫", "villager": "平民",
+    "hunter": "猎人", "mirror_maiden": "魔镜少女", "hidden_wolf": "觉醒隐狼",
 }
-WOLF_ROLES = {"werewolf", "wolf_beauty"}
-GOD_ROLES = {"seer", "witch", "knight", "guard"}
+WOLF_ROLES = {"werewolf", "wolf_beauty", "hidden_wolf"}
+GOD_ROLES = {"seer", "witch", "knight", "guard", "hunter", "mirror_maiden"}
 ROLE_DECK = (["werewolf"] * 3 + ["wolf_beauty", "seer", "witch", "knight", "guard"]
              + ["villager"] * 4)
+# 镜隐迷踪：三小狼 + 觉醒隐狼 vs 魔镜少女 + 守卫 + 女巫 + 猎人 + 四平民
+MIRROR_DECK = (["werewolf"] * 3 + ["hidden_wolf", "mirror_maiden", "guard", "witch", "hunter"]
+               + ["villager"] * 4)
+BOARD_DECKS = {"classic": ROLE_DECK, "mirror": MIRROR_DECK}
+BOARD_NAMES = {
+    "classic": "预女骑守 + 狼美人",
+    "mirror": "镜隐迷踪",
+}
+# 隐狼学到的身份 → 它对魔镜少女显现的身份（学什么显示什么，学狼人显示"狼人"）
+HIDDEN_WOLF_LEARNABLE = {
+    "witch": "witch", "seer": "seer", "guard": "guard", "hunter": "hunter",
+    "villager": "villager", "werewolf": "werewolf", "wolf_beauty": "werewolf",
+    "hidden_wolf": "werewolf",
+}
 
 
 def setup_state() -> Dict[str, Any]:
@@ -51,14 +66,17 @@ def _seeded_rng(seed: Optional[int]) -> random.Random:
 
 def create_game(human_seat: int = 0, debug_role: str = "random",
                 seed: Optional[int] = None, wolf_self_kill: bool = True,
-                profile_memories: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                profile_memories: Optional[Dict[str, Any]] = None,
+                board: str = "classic") -> Dict[str, Any]:
     if human_seat not in range(0, 13):
         raise ValueError("真人座位必须为0（随机）或1到12")
+    if board not in BOARD_DECKS:
+        raise ValueError("未知板子")
     if debug_role not in {*ROLE_LABELS, "random"}:
         raise ValueError("调试身份无效")
     rng = _seeded_rng(seed)
     chosen_seat = human_seat or rng.randint(1, 12)
-    deck = list(ROLE_DECK)
+    deck = list(BOARD_DECKS[board])
     if debug_role != "random":
         deck.remove(debug_role)
         rng.shuffle(deck)
@@ -85,10 +103,18 @@ def create_game(human_seat: int = 0, debug_role: str = "random",
         "sheriff_candidates": [],
         "sheriff_election_players": [], "vote_summary": {},
         "sheriff": None, "sheriff_badge": True, "badge_transfer_required": None,
+        "sheriff_election_delayed": False,
         "abilities": {
             "witch_medicine": True, "witch_poison": True, "guard_last": None,
             "knight_used": False, "seer_checks": {}, "beauty_charm": {},
+            # 镜隐迷踪专用
+            "hidden_wolf_learned": {},   # {seat: learned_role}
+            "hidden_wolf_poison": True,  # 隐狼学到女巫后继承的"救不活的毒"
+            "hidden_wolf_checks": {},    # 隐狼学到预言家后的查验记录
+            "hidden_wolf_guard_last": None,  # 隐狼学到守卫后的连守记录
+            "hunter_shots": {},          # {seat: True 已开枪}
         },
+        "board": board,
         "wolf_chat": [],
         "ai_profiles": ai_profiles,
         "ai_memories": {
@@ -106,7 +132,7 @@ def create_game(human_seat: int = 0, debug_role: str = "random",
             for seat in range(1, 13) if seat != chosen_seat
         },
         "rules": {
-            "board": "预女骑守 + 狼美人", "win_condition": "屠边",
+            "board": BOARD_NAMES[board], "win_condition": "屠边",
             "sheriff_vote_weight": 1.5, "guard_cannot_repeat": True,
             "guard_save_conflict_kills": True,
             "wolf_can_self_kill": bool(wolf_self_kill),
@@ -207,6 +233,16 @@ def _targets_for(state: Dict[str, Any], actor: int, action: str) -> List[int]:
         return [seat for seat in alive if seat != actor and _role(state, seat) not in WOLF_ROLES]
     if action == "divine":
         return [seat for seat in alive if seat != actor]
+    if action == "mirror_peek":
+        return [seat for seat in alive if seat != actor]
+    if action == "hidden_learn":
+        return [seat for seat in alive if seat != actor]
+    if action == "hidden_blade":
+        # 隐狼带刀：不能刀自己；学狼人可双刀（两个不同目标）
+        return [seat for seat in alive if seat != actor]
+    if action == "hidden_skill":
+        # 继承技能：查验/守护/毒，目标都不含自己（守可以含，但统一排自己更安全）
+        return [seat for seat in alive if seat != actor]
     if action == "guard":
         targets = list(alive)
         if state["rules"]["guard_cannot_repeat"] and state["abilities"]["guard_last"] in targets:
@@ -251,15 +287,134 @@ def _advance_queue(state: Dict[str, Any]) -> None:
 def _start_night(state: Dict[str, Any]) -> None:
     state["phase"] = "night_wolf_chat"
     state["night"] = {"wolf_votes": {}, "wolf_target": None, "guard": None,
-                      "saved": False, "poison": None, "deaths": []}
+                      "saved": False, "poison": None, "deaths": [],
+                      "wolf_targets": [],  # mirror 板子双刀用（小狼刀 + 隐狼刀）
+                      "hidden_poison": None, "hidden_guard": None}
     wolves = [seat for seat in _alive(state) if _role(state, seat) in WOLF_ROLES]
     if state["human_seat"] in wolves:
         wolves = [state["human_seat"]]
     _add_event(state, "system", f"第{state['day'] + 1}夜开始。", phase="night")
+    if state.get("board") == "mirror":
+        # 镜隐迷踪：第 1 夜先让隐狼学习，且隐狼不参与小狼狼聊/刀口投票
+        hidden = _alive_role(state, "hidden_wolf")
+        _start_hidden_wolf_learn(state)
+        return
     _start_queue(state, "night_wolf_chat", "wolf_chat", wolves,
                  prompt=("你是狼队指挥，请独立安排刀口、悍跳、冲锋或倒钩战术。电脑狼会执行你的安排。"
                          if state["human_seat"] in wolves
                          else "与狼队讨论刀口、悍跳、冲锋或倒钩安排。"))
+
+
+def _start_hidden_wolf_learn(state: Dict[str, Any]) -> None:
+    """镜隐迷踪：第 1 夜隐狼学习一名玩家（终身固定，不能学自己）。"""
+    hidden = _alive_role(state, "hidden_wolf")
+    if hidden and not any(seat in state["abilities"]["hidden_wolf_learned"] for seat in hidden):
+        _start_queue(state, "night_hidden_learn", "hidden_learn", hidden,
+                     prompt="选择一名玩家学习，获得其身份与技能（不能学自己，终身固定）。")
+    else:
+        _start_mirror_wolf_chat(state)
+
+
+def _start_mirror_wolf_chat(state: Dict[str, Any]) -> None:
+    """镜隐迷踪：小狼聊刀口（隐狼不互通、不参与）。"""
+    wolves = [seat for seat in _alive(state) if _role(state, seat) in {"werewolf"}]
+    if state["human_seat"] in wolves:
+        wolves = [state["human_seat"]]
+    _start_queue(state, "night_wolf_chat", "wolf_chat", wolves,
+                 prompt=("你是狼队指挥，请独立安排刀口、悍跳、冲锋或倒钩战术。电脑狼会执行你的安排。"
+                         if state["human_seat"] in wolves
+                         else "与狼队讨论刀口、悍跳、冲锋或倒钩安排。"))
+
+
+def _mirror_hidden_has_blade(state: Dict[str, Any]) -> bool:
+    """镜隐迷踪：入夜时场上没有小狼 → 隐狼带刀。"""
+    return not any(_role(state, seat) == "werewolf" for seat in _alive(state))
+
+
+def _mirror_queue_complete(state: Dict[str, Any], phase: str) -> None:
+    """镜隐迷踪的夜间顺序链。"""
+    if phase == "night_hidden_learn":
+        _start_mirror_wolf_chat(state)
+    elif phase == "night_wolf_chat":
+        # 小狼聊完 → 小狼投票定刀口
+        wolves = [seat for seat in _alive(state) if _role(state, seat) in {"werewolf"}]
+        if state["human_seat"] in wolves:
+            wolves = [state["human_seat"]]
+        _start_queue(state, "night_wolf_vote", "wolf_kill", wolves,
+                     prompt="选择今晚的狼人击杀目标。")
+    elif phase == "night_wolf_vote":
+        votes = state["night"]["wolf_votes"]
+        state["night"]["wolf_target"] = _plurality(votes, state, "wolf-kill")
+        _mirror_start_hidden_blade(state)
+    elif phase == "night_hidden_blade":
+        # 隐狼带刀后决定自己的刀口
+        _mirror_start_maiden(state)
+    elif phase == "night_maiden":
+        _mirror_start_hidden_skill(state)
+    elif phase == "night_hidden_skill":
+        _start_queue(state, "night_guard", "guard", _alive_role(state, "guard"),
+                     prompt="选择今晚的守护目标，不能连续两晚守同一人。")
+    elif phase == "night_guard":
+        _start_queue(state, "night_witch_save", "witch_save", _alive_role(state, "witch"),
+                     prompt="今晚狼人袭击了目标，是否使用解药？")
+    elif phase == "night_witch_save":
+        _start_witch_poison(state)
+    elif phase == "night_witch_poison":
+        _resolve_night(state)
+
+
+def _mirror_start_hidden_blade(state: Dict[str, Any]) -> None:
+    """镜隐迷踪：入夜时小狼全灭 → 隐狼带刀，决定自己的刀口。"""
+    hidden = _alive_role(state, "hidden_wolf")
+    if not hidden:
+        _mirror_start_maiden(state)
+        return
+    if not _mirror_hidden_has_blade(state):
+        _mirror_start_maiden(state)
+        return
+    learned = state["abilities"]["hidden_wolf_learned"].get(str(hidden[0]))
+    double = learned in {"werewolf"}  # 学狼人才能双刀
+    prompt = ("小狼已全灭，你已获得狼刀。你学的是狼人，今晚可连刀两名不同玩家。"
+              if double else "小狼已全灭，你已获得狼刀，今晚可刀一名玩家。")
+    _start_queue(state, "night_hidden_blade", "hidden_blade", hidden, prompt=prompt)
+
+
+def _mirror_start_maiden(state: Dict[str, Any]) -> None:
+    _start_queue(state, "night_maiden", "mirror_peek", _alive_role(state, "mirror_maiden"),
+                 prompt="选择一名玩家查验，将得知其具体身份。")
+
+
+def _mirror_start_hidden_skill(state: Dict[str, Any]) -> None:
+    """镜隐迷踪：隐狼使用继承技能（预言/守护/毒）。
+
+    规则：第 1 晚学到的技能，第 1 晚都不能使用（本局第 1 夜 day==0），从第 2 夜起可用。
+    """
+    # 第 1 夜（day==0）隐狼刚完成学习，所有继承技能本夜不可用
+    if state["day"] == 0:
+        _start_queue(state, "night_guard", "guard", _alive_role(state, "guard"),
+                     prompt="选择今晚的守护目标，不能连续两晚守同一人。")
+        return
+    hidden = _alive_role(state, "hidden_wolf")
+    for seat in hidden:
+        learned = state["abilities"]["hidden_wolf_learned"].get(str(seat))
+        if learned == "seer":
+            _start_queue(state, "night_hidden_skill", "hidden_skill", [seat],
+                         prompt="你学的是预言家，可查验一名玩家。")
+            state["phase_data"]["skill"] = "seer"
+            return
+        if learned == "guard":
+            _start_queue(state, "night_hidden_skill", "hidden_skill", [seat],
+                         prompt="你学的是守卫，可守护一名玩家（可挡毒）。")
+            state["phase_data"]["skill"] = "guard"
+            return
+        if learned == "witch" and state["abilities"]["hidden_wolf_poison"]:
+            _start_queue(state, "night_hidden_skill", "hidden_skill", [seat],
+                         prompt="你学的是女巫，可用毒药（被你的毒击杀者女巫也救不活）。")
+            state["phase_data"]["skill"] = "poison"
+            return
+    # 没有可用的继承技能 → 直接进守卫
+    _start_queue(state, "night_guard", "guard", _alive_role(state, "guard"),
+                 prompt="选择今晚的守护目标，不能连续两晚守同一人。")
 
 
 def _publish_simultaneous_result(state: Dict[str, Any]) -> None:
@@ -351,6 +506,15 @@ def _queue_complete(state: Dict[str, Any]) -> None:
     phase = state["phase"]
     _publish_simultaneous_result(state)
     state["pending"] = None
+    # mirror 板子只有夜间链不同；白天阶段（警长竞选/发言/退水/投票/复盘等）
+    # 必须走回原链，否则队列耗尽后 pending=None 直接死锁。
+    if state.get("board") == "mirror" and phase in {
+        "night_hidden_learn", "night_wolf_chat", "night_wolf_vote",
+        "night_hidden_blade", "night_maiden", "night_hidden_skill",
+        "night_guard", "night_witch_save", "night_witch_poison",
+    }:
+        _mirror_queue_complete(state, phase)
+        return
     if phase == "night_wolf_chat":
         wolves = [seat for seat in _alive(state) if _role(state, seat) in WOLF_ROLES]
         if state["human_seat"] in wolves:
@@ -447,16 +611,38 @@ def _start_witch_poison(state: Dict[str, Any]) -> None:
 
 def _resolve_night(state: Dict[str, Any]) -> None:
     night = state["night"]
-    victim = night.get("wolf_target")
     guard = night.get("guard")
     saved = night.get("saved", False)
     deaths: List[int] = []
-    if victim:
-        protected = victim == guard or saved
-        if victim == guard and saved and state["rules"]["guard_save_conflict_kills"]:
-            protected = False
-        if not protected:
-            deaths.append(victim)
+
+    if state.get("board") == "mirror":
+        # 双刀：小狼刀 + 隐狼刀（可能只有一把）
+        targets = []
+        if night.get("wolf_target"):
+            targets.append(night["wolf_target"])
+        for t in night.get("wolf_targets", []):
+            if t and t not in targets:
+                targets.append(t)
+        for victim in targets:
+            protected = victim == guard or saved
+            if victim == guard and saved and state["rules"]["guard_save_conflict_kills"]:
+                protected = False
+            if not protected:
+                if victim not in deaths:
+                    deaths.append(victim)
+        # 隐狼继承女巫的毒（救不活）
+        hp = night.get("hidden_poison")
+        if hp and hp not in deaths:
+            deaths.append(hp)
+    else:
+        victim = night.get("wolf_target")
+        if victim:
+            protected = victim == guard or saved
+            if victim == guard and saved and state["rules"]["guard_save_conflict_kills"]:
+                protected = False
+            if not protected:
+                deaths.append(victim)
+
     poisoned = night.get("poison")
     if poisoned and poisoned not in deaths:
         deaths.append(poisoned)
@@ -471,10 +657,16 @@ def _resolve_night(state: Dict[str, Any]) -> None:
 
 
 def _reveal_night_result(state: Dict[str, Any], resume: str) -> None:
-    deaths = list(state["night"].get("deaths", []))
+    night = state["night"]
+    deaths = list(night.get("deaths", []))
+    poisoned = night.get("poison")
+    hidden_poisoned = night.get("hidden_poison")
     state["night"]["report_deferred"] = False
     for seat in deaths:
-        _kill(state, seat, "夜间死亡")
+        if seat == poisoned or seat == hidden_poisoned:
+            _kill(state, seat, "被毒杀")  # 被毒死，猎人不能开枪
+        else:
+            _kill(state, seat, "夜间死亡")
     if deaths:
         _add_event(state, "death", "天亮了，昨夜死亡玩家：" + "、".join(f"{seat}号" for seat in deaths) + "。")
     else:
@@ -484,6 +676,9 @@ def _reveal_night_result(state: Dict[str, Any], resume: str) -> None:
 
 def _start_sheriff_election(state: Dict[str, Any]) -> None:
     alive = _alive(state)
+    # 竞选被第一天自爆打断后，第二天必须从一轮全新的上警选择开始。
+    state["sheriff_candidates"] = []
+    state["sheriff_election_players"] = []
     if state["human_seat"] in alive:
         alive = [state["human_seat"]] + [seat for seat in alive if seat != state["human_seat"]]
     state["phase"] = "sheriff_campaign"
@@ -493,6 +688,49 @@ def _start_sheriff_election(state: Dict[str, Any]) -> None:
                            "simultaneous": True, "published": False}
     _add_event(state, "system", "第一天警长竞选开始，所有存活玩家同时决定是否上警。", phase="sheriff")
     _queue_request(state)
+
+
+DAY_SPEECH_PHASES = {"sheriff_speech", "sheriff_pk_speech", "day_speech", "day_pk_speech"}
+
+
+def _can_wolf_explode(state: Dict[str, Any], seat: int) -> bool:
+    """Return whether a living ordinary wolf may interrupt the current day."""
+    return (
+        state.get("phase") in DAY_SPEECH_PHASES
+        and seat in _alive(state)
+        and _role(state, seat) == "werewolf"
+        and state.get("winner") is None
+    )
+
+
+def _wolf_explode(state: Dict[str, Any], seat: int) -> None:
+    if not _can_wolf_explode(state, seat):
+        raise ValueError("当前阶段不能自爆，只有存活的小狼可在白天发言阶段自爆")
+    sheriff_speech = state["phase"] in {"sheriff_speech", "sheriff_pk_speech"}
+    if sheriff_speech:
+        if state["day"] == 1 and state.get("sheriff_badge"):
+            state["sheriff_election_delayed"] = True
+        elif state["day"] >= 2 and state.get("sheriff_badge"):
+            state["sheriff_badge"] = False
+            state["sheriff"] = None
+            state["sheriff_candidates"] = []
+            state["sheriff_election_players"] = []
+            state["sheriff_election_delayed"] = False
+            _add_event(state, "sheriff", "第二天警上自爆，警徽被吞，本局不再竞选警长。", seat)
+    _player(state, seat)["revealed_role"] = "werewolf"
+    _add_event(state, "ability", f"{seat}号狼人自爆，翻牌狼人！白天立即结束，进入黑夜。", seat)
+    _kill(state, seat, "狼人自爆", reveal="role")
+    # 自爆必须立即打断白天；即使自爆者曾经是警长，也不能再弹出警徽移交。
+    if state.get("sheriff") == seat or state.get("badge_transfer_required") == seat:
+        state["sheriff"] = None
+        state["sheriff_badge"] = False
+        state["badge_transfer_required"] = None
+    # 第一天警长竞选期间，昨夜结果原本被延迟公布。先结算它，避免开始新夜时
+    # 丢失上一夜的死亡记录；结算完成后由 post_explode 进入下一夜。
+    if state.get("night", {}).get("report_deferred"):
+        _reveal_night_result(state, "post_explode")
+    else:
+        _after_deaths(state, "post_explode")
 
 
 def _start_sheriff_speeches(state: Dict[str, Any], candidates: List[int]) -> None:
@@ -682,6 +920,17 @@ def _kill(state: Dict[str, Any], seat: int, cause: str, reveal: Optional[str] = 
         if target in _alive(state):
             _add_event(state, "ability", f"狼美人{seat}号死亡，{target}号殉情。")
             _kill(state, target, "狼美人殉情")
+    # 猎人：被放逐或被刀可开枪，被毒不能开枪（cause 里含"毒"的不能）。
+    # 镜隐迷踪中，隐狼学习猎人后也继承这项死亡触发技能。
+    learned_hunter = (
+        state.get("board") == "mirror"
+        and _role(state, seat) == "hidden_wolf"
+        and state["abilities"]["hidden_wolf_learned"].get(str(seat)) == "hunter"
+    )
+    if (_role(state, seat) == "hunter" or learned_hunter) \
+            and not state["abilities"]["hunter_shots"].get(str(seat)):
+        if "毒" not in cause:
+            state.setdefault("_hunter_shots_pending", []).append(seat)
 
 
 def _winner(state: Dict[str, Any]) -> Optional[str]:
@@ -746,6 +995,19 @@ def migrate_legacy_postgame(state: Dict[str, Any]) -> bool:
 
 
 def _after_deaths(state: Dict[str, Any], resume: str) -> None:
+    # 猎人开枪：先处理待开枪的猎人（在胜负判定之前）
+    pending_shots = state.pop("_hunter_shots_pending", [])
+    if pending_shots:
+        hunter = pending_shots[0]
+        alive_targets = [seat for seat in _alive(state) if seat != hunter]
+        if alive_targets:
+            state["_hunter_shoot_resume"] = resume
+            state["phase"] = "hunter_shoot"
+            state["phase_data"] = {"resume": resume, "hunter": hunter}
+            _request(state, hunter, "hunter_shoot", alive_targets,
+                     "你是猎人，死亡时可开枪带走一名玩家；也可选择不开枪。", allow_none=True)
+            return
+        # 没有可开枪目标 → 直接继续
     if _finish_if_needed(state):
         return
     dead_sheriff = state.get("badge_transfer_required")
@@ -763,11 +1025,16 @@ def _after_deaths(state: Dict[str, Any], resume: str) -> None:
 
 def _resume(state: Dict[str, Any], resume: str) -> None:
     if resume == "post_night":
-        if state["day"] == 1 and state["sheriff_badge"]:
+        if state.get("sheriff_election_delayed") and state.get("sheriff_badge"):
+            state["sheriff_election_delayed"] = False
+            _start_sheriff_election(state)
+        elif state["day"] == 1 and state["sheriff_badge"]:
             _start_sheriff_election(state)
         else:
             _start_day_speech(state)
     elif resume in {"post_exile", "post_duel_success"}:
+        _start_night(state)
+    elif resume == "post_explode":
         _start_night(state)
     elif resume == "post_duel_fail":
         _queue_request(state)
@@ -783,9 +1050,19 @@ def get_visible_state(state: Dict[str, Any], seat: int) -> Dict[str, Any]:
         return deepcopy(state)
     own_role = _role(state, seat)
     roles_revealed = state.get("winner") is not None
-    known_wolf_team = ({other for other in range(1, 13)
-                        if _role(state, other) in WOLF_ROLES}
-                       if own_role in WOLF_ROLES else set())
+    if state.get("board") == "mirror":
+        # 镜隐迷踪：隐狼与小狼互不知身份
+        if own_role == "hidden_wolf":
+            known_wolf_team = set()
+        elif own_role == "werewolf":
+            known_wolf_team = {other for other in range(1, 13)
+                               if _role(state, other) == "werewolf" and other != seat}
+        else:
+            known_wolf_team = set()
+    else:
+        known_wolf_team = ({other for other in range(1, 13)
+                            if _role(state, other) in WOLF_ROLES}
+                           if own_role in WOLF_ROLES else set())
     human_viewer = seat == state["human_seat"]
     players = []
     simultaneous_hidden = (
@@ -816,8 +1093,12 @@ def get_visible_state(state: Dict[str, Any], seat: int) -> Dict[str, Any]:
         })
     private: Dict[str, Any] = {}
     if own_role in WOLF_ROLES:
-        private["wolf_teammates"] = sorted(known_wolf_team - {seat})
-        private["wolf_chat"] = deepcopy(state["wolf_chat"])
+        if own_role == "hidden_wolf":
+            # 隐狼不互通：不知道狼队友，也不看小狼的夜聊
+            private["wolf_teammates"] = []
+        else:
+            private["wolf_teammates"] = sorted(known_wolf_team - {seat})
+            private["wolf_chat"] = deepcopy(state["wolf_chat"])
     if own_role == "seer":
         private["seer_checks"] = deepcopy(state["abilities"]["seer_checks"].get(str(seat), []))
     if own_role == "witch":
@@ -831,6 +1112,24 @@ def get_visible_state(state: Dict[str, Any], seat: int) -> Dict[str, Any]:
         private["duel_available"] = not state["abilities"]["knight_used"] and _player(state, seat)["alive"]
     if own_role == "wolf_beauty":
         private["charmed_player"] = state["abilities"]["beauty_charm"].get(str(seat))
+    if own_role == "hidden_wolf":
+        private["learned_role"] = state["abilities"]["hidden_wolf_learned"].get(str(seat))
+        if private["learned_role"] == "seer":
+            private["hidden_checks"] = deepcopy(state["abilities"]["hidden_wolf_checks"].get(str(seat), []))
+        if private["learned_role"] == "witch":
+            private["hidden_poison"] = state["abilities"]["hidden_wolf_poison"]
+        if private["learned_role"] == "guard":
+            private["hidden_guard_last"] = state["abilities"]["hidden_wolf_guard_last"]
+        # 活着的隐狼仍与小狼互不知身份；真人出局后进入观战，可查看已记录的狼聊。
+        # 只给真人视角开放，避免把额外的死后信息传给 AI。
+        if seat == state["human_seat"] and not _player(state, seat)["alive"]:
+            private["wolf_chat"] = deepcopy(state["wolf_chat"])
+    if own_role == "mirror_maiden":
+        private["mirror_peeks"] = deepcopy(state["abilities"].get("mirror_peeks", {}).get(str(seat), []))
+    if own_role == "hunter":
+        private["shot_available"] = not state["abilities"]["hunter_shots"].get(str(seat))
+    if own_role == "hidden_wolf" and private.get("learned_role") == "hunter":
+        private["shot_available"] = not state["abilities"]["hunter_shots"].get(str(seat))
     return {
         "schema": 2, "game_id": state["game_id"], "day": state["day"], "phase": state["phase"],
         "rules": deepcopy(state["rules"]), "players": players, "history": deepcopy(state["history"]),
@@ -854,6 +1153,7 @@ def public_state_for_human(state: Dict[str, Any]) -> Dict[str, Any]:
         return deepcopy(state)
     result = get_visible_state(state, state["human_seat"])
     result["human_seat"] = state["human_seat"]
+    result["board"] = state.get("board", "classic")
     raw_pending = state["pending"]
     result["can_human_act"] = bool(raw_pending and raw_pending["actor"] == state["human_seat"])
     result["can_advance_ai"] = bool(raw_pending and raw_pending["actor"] != state["human_seat"])
@@ -862,6 +1162,10 @@ def public_state_for_human(state: Dict[str, Any]) -> Dict[str, Any]:
     simultaneous_wait = bool(state.get("phase_data", {}).get("simultaneous"))
     human_is_wolf = _role(state, state["human_seat"]) in WOLF_ROLES
     wolf_channel = state["phase"] in {"night_wolf_chat", "night_wolf_vote"}
+    # 镜隐迷踪的觉醒隐狼与小狼互不知身份，也不能看到狼聊中是谁发言、
+    # 当前轮到谁思考。即使真人自己是隐狼，也要按旁观者视角隐藏队伍进度。
+    if state.get("board") == "mirror" and _role(state, state["human_seat"]) == "hidden_wolf":
+        wolf_channel = False
     if pending and not result["can_human_act"] and (
         (private_night and not (human_is_wolf and wolf_channel)) or simultaneous_wait
     ):
@@ -878,6 +1182,7 @@ def public_state_for_human(state: Dict[str, Any]) -> Dict[str, Any]:
         result["self"]["role"] == "knight" and result["self"]["alive"]
         and result["private"].get("duel_available") and state["phase"] == "day_speech"
     )
+    result["can_wolf_explode"] = _can_wolf_explode(state, state["human_seat"])
     return result
 
 
@@ -891,6 +1196,9 @@ class HumanGameEngine:
             raise ValueError("当前没有可推进的AI行动")
         if pending["actor"] == state["human_seat"]:
             raise ValueError("当前必须等待真人操作")
+        if not getattr(self.provider, "batch_actions", True):
+            self._advance_one_ai(state)
+            return
         if state["phase"].startswith("night_"):
             self._drain_night_ai(state)
             return
@@ -936,10 +1244,15 @@ class HumanGameEngine:
         if action == "knight_duel":
             self._knight_duel(state, state["human_seat"], intent.get("target"))
             return
+        if action == "wolf_explode":
+            _wolf_explode(state, state["human_seat"])
+            return
         pending = state.get("pending")
         if not pending or pending["actor"] != state["human_seat"]:
             raise ValueError("当前没有轮到真人操作")
         self._apply(state, state["human_seat"], intent)
+        if not getattr(self.provider, "batch_actions", True):
+            return
         if (state.get("pending") and state.get("phase_data", {}).get("simultaneous")
                 and state["phase"] != "mvp_vote"
                 and state["pending"]["actor"] != state["human_seat"]):
@@ -976,6 +1289,52 @@ class HumanGameEngine:
             target = _target(intent, allowed)
             check = {"day": state["day"] + 1, "seat": target, "is_wolf": _role(state, target) in WOLF_ROLES}
             state["abilities"]["seer_checks"].setdefault(str(actor), []).append(check)
+        elif action == "hidden_learn":
+            target = _target(intent, allowed)
+            learned = _role(state, target)
+            state["abilities"]["hidden_wolf_learned"][str(actor)] = learned
+            _remember(state, actor, "note", {"day": state["day"] + 1, "learned": learned, "target": target})
+        elif action == "hidden_blade":
+            # 隐狼带刀：学狼人可双刀（两个不同目标）
+            learned = state["abilities"]["hidden_wolf_learned"].get(str(actor))
+            if learned in {"werewolf"}:
+                t1 = _target(intent, allowed)
+                t2 = _optional_target(intent, allowed, key="second_target")
+                if t2 is not None and t2 == t1:
+                    raise ValueError("双刀必须选择两个不同的目标")
+                state["night"]["wolf_targets"] = [t1] + ([t2] if t2 is not None else [])
+            else:
+                t1 = _target(intent, allowed)
+                state["night"]["wolf_targets"] = [t1]
+        elif action == "hidden_skill":
+            skill = state["phase_data"].get("skill")
+            target = _optional_target(intent, allowed)
+            if skill == "seer":
+                if target is None:
+                    raise ValueError("请选择查验目标")
+                check = {"day": state["day"] + 1, "seat": target,
+                         "is_wolf": _role(state, target) in WOLF_ROLES}
+                state["abilities"]["hidden_wolf_checks"].setdefault(str(actor), []).append(check)
+            elif skill == "guard":
+                if target is None:
+                    target = _target(intent, allowed)
+                state["night"]["hidden_guard"] = target
+                state["abilities"]["hidden_wolf_guard_last"] = target
+            elif skill == "poison":
+                if target is not None:
+                    state["abilities"]["hidden_wolf_poison"] = False
+                    state["night"]["hidden_poison"] = target
+        elif action == "mirror_peek":
+            target = _target(intent, allowed)
+            real = _role(state, target)
+            if real == "hidden_wolf":
+                # 隐狼：显示它学到的角色（学什么显示什么）
+                learned = state["abilities"]["hidden_wolf_learned"].get(str(target))
+                shown = HIDDEN_WOLF_LEARNABLE.get(learned, learned)
+            else:
+                shown = real
+            check = {"day": state["day"] + 1, "seat": target, "shown_role": shown}
+            state["abilities"].setdefault("mirror_peeks", {}).setdefault(str(actor), []).append(check)
         elif action == "witch_save":
             use = bool(intent.get("use"))
             if use and not state["abilities"]["witch_medicine"]:
@@ -1061,6 +1420,21 @@ class HumanGameEngine:
                 state["phase_data"] = interrupted["phase_data"]
             _resume(state, resume)
             return
+        elif action == "hunter_shoot":
+            target = _optional_target(intent, allowed)
+            hunter = state["phase_data"]["hunter"]
+            resume = state["phase_data"]["resume"]
+            state["abilities"]["hunter_shots"][str(hunter)] = True
+            state["phase"] = state["phase_data"].get("prev_phase", "day_speech")
+            if target is not None:
+                _add_event(state, "ability", f"猎人{hunter}号开枪，带走{target}号。", hunter)
+                _kill(state, target, "猎人枪击")
+                # 被枪击的也可能是猎人 → 递归开枪
+                if state.get("_hunter_shots_pending"):
+                    shot = state.pop("_hunter_shots_pending")[0]
+                    state.setdefault("_hunter_shots_pending", []).append(shot)
+            _after_deaths(state, resume)
+            return
         elif action == "last_words":
             text = _clean_text(intent.get("text"))
             _add_event(state, "speech", text, actor, phase="last_words")
@@ -1078,7 +1452,9 @@ class HumanGameEngine:
         _advance_queue(state)
 
     def _maybe_ai_knight_duel(self, state: Dict[str, Any]) -> bool:
-        if state["abilities"]["knight_used"] or getattr(self.provider, "name", "") == "codex":
+        # 不再按 provider 名字跳过：桥接模式下由 Worker 预先写好 responses/<id>.json，
+        # 这里的同步调用就能拿到决定；没预写时返回 None，自然视作"这一拍不决斗"。
+        if state["abilities"]["knight_used"]:
             return False
         knights = [seat for seat in _alive_role(state, "knight") if seat != state["human_seat"]]
         if not knights:
@@ -1144,8 +1520,8 @@ def _target(intent: Dict[str, Any], allowed: List[int]) -> int:
     return target
 
 
-def _optional_target(intent: Dict[str, Any], allowed: List[int]) -> Optional[int]:
-    value = intent.get("target")
+def _optional_target(intent: Dict[str, Any], allowed: List[int], key: str = "target") -> Optional[int]:
+    value = intent.get(key)
     if value in (None, "", "abstain", "none"):
         return None
-    return _target(intent, allowed)
+    return _target({"target": value}, allowed)

@@ -9,18 +9,195 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
+import shlex
 import shutil
 import subprocess
 import tempfile
+import urllib.error
+import urllib.request
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Sequence
+
+ACTION_TARGET_REQUIRED = {
+    "wolf_kill", "charm", "guard", "divine", "sheriff_recommend", "mvp_vote",
+}
+ACTION_TARGET_OPTIONAL = ACTION_TARGET_REQUIRED | {
+    "vote", "witch_poison", "sheriff_transfer", "knight_decide",
+}
+ACTION_SPEECH = {"speech", "pk_speech", "campaign_speech", "last_words", "postgame_speech"}
+ROLE_LABELS = {
+    "werewolf": "狼人", "wolf_beauty": "狼美人", "hidden_wolf": "觉醒隐狼",
+    "seer": "预言家", "witch": "女巫", "knight": "骑士", "guard": "守卫",
+    "hunter": "猎人", "mirror_maiden": "魔镜少女", "villager": "平民",
+}
+_ENVELOPE_KEYS = ("structured_output", "result", "response", "output", "content", "text")
+_QUOTA_HINTS = ("usage limit", "rate limit", "quota", "too many requests", "429")
+_AUTH_HINTS = ("unauthorized", "invalid api key", "not logged in", "authentication failed", "401")
+
+
+def summarize_cli_error(detail: str, label: str, limit: int = 240) -> str:
+    """Turn raw CLI stderr into one short, actionable message.
+
+    Codex echoes the whole prompt back on failure, so the raw tail is mostly
+    payload and buries the actual cause.  Prefer the explicit ``ERROR:`` lines
+    the CLIs print, and name the two failures users actually hit.
+    """
+    text = (detail or "").strip()
+    if not text:
+        return f"{label}调用失败，并且没有输出任何错误信息。"
+    errors = [line.strip() for line in text.splitlines()
+              if line.strip().upper().startswith("ERROR:")]
+    hint = errors[-1][:limit] if errors else text[-limit:]
+    lowered = text.lower()
+    if ("failed to initialize in-process app-server client" in lowered
+            and any(token in lowered for token in ("os error 5", "access is denied", "拒绝访问"))):
+        return (f"{label}启动被 Windows 拒绝访问（os error 5）。"
+                "请关闭当前面板，从 Windows 正常终端或“启动狼人杀.bat”重新启动；"
+                "不要从受限的 Codex 沙盒进程启动面板。存档保留，可继续原对局。")
+    if any(token in lowered for token in _QUOTA_HINTS):
+        return (f"{label}的额度或频率已用尽，本次行动无法完成；"
+                f"请换后端后重试（--provider cli，或 --provider api）。原始提示：{hint}")
+    if any(token in lowered for token in _AUTH_HINTS):
+        return f"{label}未登录或凭据已失效，请先重新登录。原始提示：{hint}"
+    return f"{label}调用失败：{hint}"
+
+
+def action_schema(action: str) -> Dict[str, Any]:
+    """The single structured-output contract that every provider must satisfy."""
+    return {
+        "type": "object",
+        "properties": {
+            "action": {"type": "string", "const": action},
+            "target": {"type": ["integer", "null"]},
+            "text": {"type": ["string", "null"]},
+            "join": {"type": ["boolean", "null"]},
+            "withdraw": {"type": ["boolean", "null"]},
+            "use": {"type": ["boolean", "null"]},
+            "direction": {
+                "type": ["string", "null"],
+                "enum": ["forward", "reverse", None],
+            },
+            "player_impressions": {
+                "type": ["array", "null"],
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "seat": {"type": "integer", "minimum": 1, "maximum": 12},
+                        "impression": {"type": "string"},
+                    },
+                    "required": ["seat", "impression"],
+                    "additionalProperties": False,
+                },
+                "maxItems": 4,
+            },
+        },
+        "required": ["action", "target", "text", "join", "withdraw", "use", "direction", "player_impressions"],
+        "additionalProperties": False,
+    }
+
+
+def action_prompt(action: str) -> str:
+    """Role prompt shared by every provider; contains no backend-specific text."""
+    postgame = ("当前是赛后复盘，胜负已经确定且全部身份已公开。players.role 是最终身份表，"
+                "它比玩家在发言或遗言中的自称更可靠，必须先核对再复盘。请结合完整公开历史、"
+                "自己的身份与私有经历，真诚说明感想、关键判断、行动目的、成功或失误之处以及全局思路；"
+                "再挑选2至4位给你留下特别印象的其他选手，在发言中自然评价其具体表现，并把同样的压缩评价"
+                "写入 player_impressions，每条不超过两句话。"
+                if action == "postgame_speech" else "")
+    mvp = ("当前是赛后MVP票选。全部身份已经公开，请以实际贡献和对胜负的影响为准公正投票，"
+           "可以投自己；target 填候选座位，text 用一到两句话概括可核对的理由，不要写长文。"
+           if action == "mvp_vote" else "")
+    mirror_rules = (
+        "如果 visible_state.rules.board 是‘镜隐迷踪’，必须遵守专属规则：魔镜少女是强化版预言家，"
+        "每晚 mirror_peek 得到目标的真实具体身份，结果不是‘好人/狼人’二分。魔镜少女要按预言家思路上警、"
+        "在警上或白天公开跳魔镜少女并准确报告查验，例如‘昨晚查验3号，具体身份是守卫’，只能报告 private.mirror_peeks "
+        "中已经得到的真实结果，不能把具体身份改说成好人或狼人；没有查验记录时不得编造验人。"
+        if action in ACTION_SPEECH or action == "mirror_peek" else
+        "如果 visible_state.rules.board 是‘镜隐迷踪’，读取该板子的专属身份和技能，不要套用经典板子的身份规则。"
+    )
+    return f"""你正在扮演一局12人狼人杀中的一个真实玩家，现在需要完成动作 {action}。
+输入JSON中的 visible_state 是你唯一知道的局面；严禁猜测或寻找未提供的隐藏身份，严禁读取文件或使用工具。
+{postgame}{mvp}
+{mirror_rules}
+结合公开发言、公开票型、你自己的身份/私有信息、历史立场、人格和策略认真判断。好人要分析发言与行为的一致性；狼人可以撒谎、悍跳、冲锋、倒钩或卖队友，但不要泄露狼队信息；狼人若在 private.wolf_chat 中看到队友已经安排战术，应优先执行该计划并在白天配合；神职要合理安排技能与信息公开时机。
+memory 中的人格、说话风格和跨局摘要属于你这个固定玩家本人，请自然延续经验与性格；过去对局中的身份和结论只可作为复盘经验，不能当成当前对局的隐藏信息。
+发言必须像中文狼人杀玩家，针对具体座位和已发生事件形成连贯逻辑；允许判断错误和合理改站边，但改站边时应解释原因。不要说自己是AI，不要用概率报告或模板化空话。
+只返回符合输出结构的行动JSON。没有使用的字段填 null。target 只能从 request.allowed_targets 中选择；允许放弃的动作可填 null。除赛后复盘外 player_impressions 填 null。"""
+
+
+def validate_intent(intent: Dict[str, Any], request: Dict[str, Any],
+                    label: str = "电脑玩家") -> None:
+    """Reject anything the rules engine could not legally apply."""
+    action = request["action"]
+    if intent.get("action") != action:
+        raise ValueError(f"{label}返回了错误的动作类型，请重试。")
+    allowed = request.get("allowed_targets", [])
+    if action in ACTION_TARGET_OPTIONAL:
+        target = intent.get("target")
+        if target is None and action in ACTION_TARGET_REQUIRED:
+            raise ValueError(f"{label}没有选择必需的目标，请重试。")
+        if target is not None and target not in allowed:
+            raise ValueError(f"{label}选择了非法目标，请重试。")
+    if action in ACTION_SPEECH and not str(intent.get("text") or "").strip():
+        raise ValueError(f"{label}没有给出发言，请重试。")
+    if action == "mvp_vote" and not str(intent.get("text") or "").strip():
+        raise ValueError(f"{label}没有给出MVP票选理由，请重试。")
+    if action == "postgame_speech":
+        impressions = intent.get("player_impressions")
+        if not isinstance(impressions, list) or not 2 <= len(impressions) <= 4:
+            raise ValueError("赛后复盘需要评价2至4位特别选手")
+    if action == "campaign" and not isinstance(intent.get("join"), bool):
+        raise ValueError(f"{label}没有决定是否上警，请重试。")
+    if action == "withdraw" and not isinstance(intent.get("withdraw"), bool):
+        raise ValueError(f"{label}没有决定是否退水，请重试。")
+    if action == "witch_save" and not isinstance(intent.get("use"), bool):
+        raise ValueError(f"{label}没有决定是否使用解药，请重试。")
+    if action == "sheriff_order" and intent.get("direction") not in {"forward", "reverse"}:
+        raise ValueError(f"{label}警长没有选择合法发言方向，请重试。")
+
+
+def parse_action_payload(raw: str, depth: int = 0) -> Dict[str, Any]:
+    """Pull one JSON action object out of whatever a CLI printed.
+
+    CLI backends differ a lot here: ``ollama`` prints the object directly,
+    Claude Code wraps it in a ``{"result": "..."}`` envelope, and weaker local
+    models like to add prose or markdown fences around it.
+    """
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError("CLI 没有输出任何内容")
+    text = raw.strip()
+    candidates = [text]
+    candidates.extend(match.group(1).strip()
+                      for match in re.finditer(r"```(?:json)?\s*(.*?)```", text, re.S))
+    start, end = text.find("{"), text.rfind("}")
+    if 0 <= start < end:
+        candidates.append(text[start:end + 1])
+    for candidate in candidates:
+        try:
+            data = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(data, dict):
+            continue
+        if "action" not in data and depth < 3:
+            for key in _ENVELOPE_KEYS:
+                value = data.get(key)
+                if isinstance(value, str) and value.strip():
+                    try:
+                        return parse_action_payload(value, depth + 1)
+                    except ValueError:
+                        continue
+        return data
+    raise ValueError("CLI 输出里没有找到 JSON 对象")
 
 
 class ActionProvider(ABC):
     """Interface implemented by every AI decision backend."""
 
     name = "base"
+    batch_actions = True
 
     @abstractmethod
     def request_action(
@@ -53,12 +230,12 @@ class BuiltinAIProvider(ActionProvider):
 
         if action == "campaign":
             role = visible_state["self"]["role"]
-            wants = role == "seer" or (role in {"werewolf", "wolf_beauty"} and seat % 2 == 0)
+            wants = role in {"seer", "mirror_maiden"} or (role in {"werewolf", "wolf_beauty"} and seat % 2 == 0)
             wants = wants or persona in {"激进", "高手"} and seat % 3 == 0
             return {"action": action, "join": wants}
         if action == "withdraw":
             role = visible_state["self"]["role"]
-            withdraw = role not in {"seer", "werewolf"} and seat % 2 == 1
+            withdraw = role not in {"seer", "mirror_maiden", "werewolf"} and seat % 2 == 1
             return {"action": action, "withdraw": withdraw}
         if action in {"vote", "wolf_kill", "divine", "guard", "charm", "sheriff_recommend"}:
             target = self._pick_target(visible_state, targets, action, key)
@@ -101,6 +278,25 @@ class BuiltinAIProvider(ActionProvider):
             return {"action": action, "direction": "forward" if seat % 2 else "reverse"}
         if action == "sheriff_transfer":
             return {"action": action, "target": self._pick_target(visible_state, targets, action, key)}
+        if action == "hidden_learn":
+            # 隐狼第 1 晚学习：盲选一名非自己玩家
+            return {"action": action, "target": _stable_choice(sorted(targets), *key)}
+        if action == "hidden_blade":
+            # 隐狼带刀：选一个目标；学狼人时给第二目标
+            target = self._pick_target(visible_state, targets, "wolf_kill", key)
+            intent = {"action": action, "target": target}
+            if "second_target" in request.get("allowed_targets", []) or "双刀" in request.get("prompt", ""):
+                second = [t for t in targets if t != target]
+                if second:
+                    intent["second_target"] = _stable_choice(sorted(second), *key)
+            return intent
+        if action == "hidden_skill":
+            return {"action": action, "target": self._pick_target(visible_state, targets, action, key)}
+        if action == "mirror_peek":
+            return {"action": action, "target": self._pick_target(visible_state, targets, action, key)}
+        if action == "hunter_shoot":
+            # 猎人开枪：默认开（带走一个），targets 不含自己
+            return {"action": action, "target": self._pick_target(visible_state, targets, action, key)}
         raise ValueError(f"内置AI不支持动作: {action}")
 
     def _pick_target(self, view, targets, action, key):
@@ -120,6 +316,11 @@ class BuiltinAIProvider(ActionProvider):
                 targets = non_wolves
         if action == "divine":
             checked = {item["seat"] for item in private.get("seer_checks", [])}
+            unchecked = [target for target in targets if target not in checked]
+            if unchecked:
+                targets = unchecked
+        if action == "mirror_peek":
+            checked = {item["seat"] for item in private.get("mirror_peeks", [])}
             unchecked = [target for target in targets if target not in checked]
             if unchecked:
                 targets = unchecked
@@ -144,6 +345,14 @@ class BuiltinAIProvider(ActionProvider):
                 check = private["seer_checks"][-1]
                 result = "狼人" if check["is_wolf"] else "好人"
                 return f"我上警是因为我底牌预言家，昨晚验了{check['seat']}号，是{result}。警徽流我会看后面的发言再定，先把验人逻辑讲清楚。"
+            if role == "mirror_maiden":
+                peeks = private.get("mirror_peeks", [])
+                if peeks:
+                    check = peeks[-1]
+                    result = ROLE_LABELS.get(check.get("shown_role"), check.get("shown_role", "未知身份"))
+                    return (f"我上警是因为我底牌魔镜少女，昨晚查验{check['seat']}号，具体身份是{result}。"
+                            "我的查验是具体身份，不是简单的好人或狼人；后续我会继续报验人和带队。")
+                return "我上警是因为我底牌魔镜少女，查验能直接得到具体身份；我会像预言家一样公开报验人、盘逻辑和带队。"
             if role in {"werewolf", "wolf_beauty"}:
                 return f"我上警想替好人多拿一点信息。现在没有必要盲信强势发言，我会重点听{focus}号的视角和后续警徽流。"
             return f"我上警不是硬跳身份，主要想把自己的视角聊清楚。{focus}号刚才的发言我还没完全听懂，后面我会根据警徽票再站边。"
@@ -151,6 +360,11 @@ class BuiltinAIProvider(ActionProvider):
             check = private["seer_checks"][-1]
             result = "狼人" if check["is_wolf"] else "好人"
             return f"我昨晚验了{check['seat']}号，是{result}。我现在更关注{focus}号前后逻辑有没有变化，今天先围绕验人和票型来出。"
+        if role == "mirror_maiden" and private.get("mirror_peeks"):
+            check = private["mirror_peeks"][-1]
+            result = ROLE_LABELS.get(check.get("shown_role"), check.get("shown_role", "未知身份"))
+            return (f"我是魔镜少女，昨晚查验{check['seat']}号，具体身份是{result}。"
+                    f"我会按预言家视角围绕验人组织今天的判断，重点听{focus}号怎么解释。")
         if role in {"werewolf", "wolf_beauty"}:
             return f"我现在不想跟着场上最响的声音走。{focus}号这轮给结论有点快，前面的票型也没解释干净，我会先听他怎么回头。"
         styles = {
@@ -164,7 +378,7 @@ class BuiltinAIProvider(ActionProvider):
         seat = view["self"]["seat"]
         role = view["self"]["role"]
         winner = view.get("winner")
-        wolf_side = role in {"werewolf", "wolf_beauty"}
+        wolf_side = role in {"werewolf", "wolf_beauty", "hidden_wolf"}
         won = winner == ("狼人阵营" if wolf_side else "好人阵营")
         result = "赢下这局很开心" if won else "这局输了有些遗憾"
         wolves = [player["seat"] for player in view["players"]
@@ -193,7 +407,8 @@ class BuiltinAIProvider(ActionProvider):
         )[:3]
         role_labels = {
             "werewolf": "狼人", "wolf_beauty": "狼美人", "seer": "预言家",
-            "witch": "女巫", "knight": "骑士", "guard": "守卫", "villager": "平民",
+            "witch": "女巫", "knight": "骑士", "guard": "守卫", "hunter": "猎人",
+            "mirror_maiden": "魔镜少女", "hidden_wolf": "觉醒隐狼", "villager": "平民",
         }
         impressions = [{
             "seat": player["seat"],
@@ -269,50 +484,58 @@ class CodexFileProvider(ActionProvider):
         return None
 
 
+DEFAULT_CODEX_MODEL = "gpt-5.6-sol"
+
+
+def _configured_codex_model(codex_home: Path) -> str:
+    """Read the user's configured model without requiring Python 3.11 TOML."""
+    config_path = codex_home / "config.toml"
+    try:
+        text = config_path.read_text(encoding="utf-8")
+    except OSError:
+        return DEFAULT_CODEX_MODEL
+    match = re.search(r"(?m)^\s*model\s*=\s*['\"]([^'\"]+)['\"]\s*$", text)
+    return match.group(1).strip() if match else DEFAULT_CODEX_MODEL
+
+
 class CodexCLIProvider(ActionProvider):
     """Ask the locally authenticated Codex CLI for one isolated player action."""
 
     name = "codex_cli"
+    batch_actions = False
 
     def __init__(self, timeout: int = 180, model: Optional[str] = None):
         self.timeout = timeout
-        self.model = model
-        self.executable = shutil.which("codex.cmd") or shutil.which("codex")
+        # Codex Desktop and Codex CLI share the ChatGPT login stored in the
+        # user's standard Codex home.  Keep the game pinned to that home by
+        # default instead of accidentally inheriting a different CODEX_HOME
+        # from a shell profile.  AIWOLF_CODEX_HOME remains an explicit escape
+        # hatch for a deliberately separate CLI profile.
+        configured_home = os.environ.get("AIWOLF_CODEX_HOME")
+        self.codex_home = Path(configured_home).expanduser() if configured_home else Path.home() / ".codex"
+        # ``--ignore-user-config`` below deliberately isolates the invocation,
+        # so always pass an explicit model.  Otherwise ChatGPT-authenticated
+        # Codex rejects the request as model=None.
+        self.model = model or _configured_codex_model(self.codex_home)
+        configured_executable = os.environ.get("CODEX_CLI_PATH")
+        candidates = []
+        if configured_executable and Path(configured_executable).is_file():
+            candidates.append(configured_executable)
+        # Prefer the desktop-installed native executable.  The npm wrapper can
+        # resolve to an older CLI and, under Windows, may fail to initialize its
+        # in-process app-server client with os error 5.
+        candidates.extend([
+            shutil.which("codex.exe"),
+            shutil.which("codex.cmd"),
+            shutil.which("codex"),
+        ])
+        self.executable = next((candidate for candidate in candidates if candidate), None)
         if not self.executable:
             raise ValueError("没有找到 Codex CLI，请先安装并登录 Codex。")
 
     def request_action(self, visible_state, request):
         action = request["action"]
-        schema = {
-            "type": "object",
-            "properties": {
-                "action": {"type": "string", "const": action},
-                "target": {"type": ["integer", "null"]},
-                "text": {"type": ["string", "null"]},
-                "join": {"type": ["boolean", "null"]},
-                "withdraw": {"type": ["boolean", "null"]},
-                "use": {"type": ["boolean", "null"]},
-                "direction": {
-                    "type": ["string", "null"],
-                    "enum": ["forward", "reverse", None],
-                },
-                "player_impressions": {
-                    "type": ["array", "null"],
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "seat": {"type": "integer", "minimum": 1, "maximum": 12},
-                            "impression": {"type": "string"},
-                        },
-                        "required": ["seat", "impression"],
-                        "additionalProperties": False,
-                    },
-                    "maxItems": 4,
-                },
-            },
-            "required": ["action", "target", "text", "join", "withdraw", "use", "direction", "player_impressions"],
-            "additionalProperties": False,
-        }
+        schema = action_schema(action)
         payload = json.dumps(
             {"request": request, "visible_state": visible_state},
             ensure_ascii=False,
@@ -340,10 +563,9 @@ class CodexCLIProvider(ActionProvider):
                 if self.model:
                     command[2:2] = ["--model", self.model]
                 environment = os.environ.copy()
-                if not environment.get("CODEX_HOME"):
-                    codex_home = Path.home() / ".codex"
-                    if codex_home.is_dir():
-                        environment["CODEX_HOME"] = str(codex_home)
+                # Always select the desktop account's auth store for this
+                # provider.  Do not copy or inspect credentials in the repo.
+                environment["CODEX_HOME"] = str(self.codex_home)
                 creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
                 completed = subprocess.run(
                     command,
@@ -358,76 +580,484 @@ class CodexCLIProvider(ActionProvider):
                     check=False,
                 )
                 if completed.returncode != 0:
-                    detail = (completed.stderr or completed.stdout or "未知错误").strip()[-600:]
-                    raise ValueError(f"Codex 玩家调用失败：{detail}")
+                    raise ValueError(summarize_cli_error(
+                        completed.stderr or completed.stdout or "", "Codex 玩家"))
                 raw = output_path.read_text(encoding="utf-8") if output_path.exists() else completed.stdout
                 intent = json.loads(raw)
         except subprocess.TimeoutExpired as exc:
             raise ValueError(f"Codex 玩家思考超过 {self.timeout} 秒，请重试。") from exc
         except json.JSONDecodeError as exc:
             raise ValueError("Codex 玩家没有返回有效行动，请重试。") from exc
-        self._validate_intent(intent, request)
+        validate_intent(intent, request, "Codex 玩家")
         return intent
 
     @staticmethod
     def _prompt(action: str) -> str:
-        postgame = ("当前是赛后复盘，胜负已经确定且全部身份已公开。players.role 是最终身份表，"
-                    "它比玩家在发言或遗言中的自称更可靠，必须先核对再复盘。请结合完整公开历史、"
-                    "自己的身份与私有经历，真诚说明感想、关键判断、行动目的、成功或失误之处以及全局思路；"
-                    "再挑选2至4位给你留下特别印象的其他选手，在发言中自然评价其具体表现，并把同样的压缩评价"
-                    "写入 player_impressions，每条不超过两句话。"
-                    if action == "postgame_speech" else "")
-        mvp = ("当前是赛后MVP票选。全部身份已经公开，请以实际贡献和对胜负的影响为准公正投票，"
-               "可以投自己；target 填候选座位，text 用一到两句话概括可核对的理由，不要写长文。"
-               if action == "mvp_vote" else "")
-        return f"""你正在扮演一局12人狼人杀中的一个真实玩家，现在需要完成动作 {action}。
-输入JSON中的 visible_state 是你唯一知道的局面；严禁猜测或寻找未提供的隐藏身份，严禁读取文件或使用工具。
-{postgame}{mvp}
-结合公开发言、公开票型、你自己的身份/私有信息、历史立场、人格和策略认真判断。好人要分析发言与行为的一致性；狼人可以撒谎、悍跳、冲锋、倒钩或卖队友，但不要泄露狼队信息；狼人若在 private.wolf_chat 中看到队友已经安排战术，应优先执行该计划并在白天配合；神职要合理安排技能与信息公开时机。
-memory 中的人格、说话风格和跨局摘要属于你这个固定玩家本人，请自然延续经验与性格；过去对局中的身份和结论只可作为复盘经验，不能当成当前对局的隐藏信息。
-发言必须像中文狼人杀玩家，针对具体座位和已发生事件形成连贯逻辑；允许判断错误和合理改站边，但改站边时应解释原因。不要说自己是AI，不要用概率报告或模板化空话。
-只返回符合输出结构的行动JSON。没有使用的字段填 null。target 只能从 request.allowed_targets 中选择；允许放弃的动作可填 null。除赛后复盘外 player_impressions 填 null。"""
+        """Kept for backwards compatibility; see ``action_prompt``."""
+        return action_prompt(action)
 
     @staticmethod
     def _validate_intent(intent: Dict[str, Any], request: Dict[str, Any]) -> None:
+        """Kept for backwards compatibility; see ``validate_intent``."""
+        validate_intent(intent, request, "Codex 玩家")
+
+
+class CliBackend:
+    """One CLI that can answer a single player action as structured JSON.
+
+    The spec is declarative on purpose so argv construction stays testable
+    without the CLI being installed: nothing here touches the filesystem.
+    """
+
+    def __init__(self, key: str, label: str, executables: Sequence[str],
+                 template: Sequence[str], prompt_mode: str,
+                 model_flag: Optional[str] = None, default_model: Optional[str] = None,
+                 note: str = ""):
+        if prompt_mode not in {"stdin", "argv"}:
+            raise ValueError(f"{key} 的 prompt_mode 只能是 stdin 或 argv")
+        if prompt_mode == "argv" and "{prompt}" not in template:
+            raise ValueError(f"{key} 用 argv 传提示词，模板里必须有 {{prompt}} 占位符")
+        if prompt_mode == "stdin" and "{prompt}" in template:
+            raise ValueError(f"{key} 用 stdin 传提示词，模板里不应出现 {{prompt}}")
+        self.key = key
+        self.label = label
+        self.executables = tuple(executables)
+        self.template = tuple(template)
+        self.prompt_mode = prompt_mode
+        self.model_flag = model_flag
+        self.default_model = default_model
+        self.note = note
+
+    def resolve_executable(self) -> str:
+        for candidate in self.executables:
+            found = shutil.which(candidate)
+            if found:
+                return found
+        raise ValueError(
+            f"没有找到 {self.label} 的可执行文件（{' / '.join(self.executables)}），"
+            "请先安装并完成登录。"
+        )
+
+    def build_argv(self, executable: str, model: Optional[str] = None,
+                   extra_args: Sequence[str] = (), prompt: str = "") -> list:
+        """Expand the template into a full command line."""
+        model = model or self.default_model
+        argv = []
+        for token in self.template:
+            if token == "{model}":
+                if not model:
+                    raise ValueError(f"{self.label} 需要在 --model 里指定模型名称")
+                argv.append(model)
+            elif token == "{prompt}":
+                argv.append(prompt)
+            else:
+                argv.append(token)
+        if self.model_flag and model and "{model}" not in self.template:
+            argv = [self.model_flag, model, *argv]
+        return [executable, *argv, *extra_args]
+
+
+CLI_BACKENDS: Dict[str, CliBackend] = {
+    "ollama": CliBackend(
+        key="ollama", label="Ollama",
+        executables=("ollama", "ollama.exe"),
+        template=("run", "{model}", "--format", "json"),
+        prompt_mode="stdin",
+        default_model="qwen3",
+        note="本地模型，--format json 强制合法 JSON；局面很长时要选上下文窗口够大的模型。",
+    ),
+    "claude": CliBackend(
+        key="claude", label="Claude Code CLI",
+        executables=("claude", "claude.cmd"),
+        template=("-p", "--output-format", "json", "--max-turns", "1"),
+        prompt_mode="stdin",
+        model_flag="--model",
+        note="--max-turns 1 限制成单轮，避免它中途去调用工具；"
+             "输出是 {result: ...} 信封，会被自动拆开。",
+    ),
+    "gemini": CliBackend(
+        key="gemini", label="Gemini CLI",
+        executables=("gemini", "gemini.cmd"),
+        template=("-p", "{prompt}"),
+        prompt_mode="argv",
+        model_flag="--model",
+        note="提示词走命令行参数，超长局面可能撞上参数长度上限。",
+    ),
+}
+
+# ``codex`` uses the same user-facing CLI mode as the other local backends,
+# but its authentication and structured-output protocol need the dedicated
+# Codex implementation above.  Keep it in the selector alongside the generic
+# backends without pretending it has the same argv template.
+CLI_BACKEND_CHOICES = ("codex", *sorted(CLI_BACKENDS))
+
+
+class GenericCLIProvider(ActionProvider):
+    """Drive any locally installed CLI that can answer one action as JSON.
+
+    Backends only differ in how they are launched and how they print JSON; the
+    output schema, the role prompt and the legality checks are shared with the
+    Codex provider.  Every call is a fresh process carrying a single seat's
+    visible state, which preserves the property that made ``codex-cli`` worth
+    having: no shared conversation, so the eleven seats cannot converge on one
+    voice.
+    """
+
+    name = "cli"
+    batch_actions = False
+
+    def __init__(self, backend: str = "ollama", model: Optional[str] = None,
+                 timeout: int = 180, retries: int = 2,
+                 extra_args: Optional[Sequence[str]] = None):
+        if backend not in CLI_BACKENDS:
+            raise ValueError(
+                f"未知 CLI 后端: {backend}；可选 {', '.join(sorted(CLI_BACKENDS))}"
+            )
+        self.backend = CLI_BACKENDS[backend]
+        self.model = model
+        self.timeout = max(10, int(timeout))
+        self.retries = max(0, int(retries))
+        self.extra_args = list(extra_args or [])
+        self.executable = self.backend.resolve_executable()
+
+    def request_action(self, visible_state, request):
         action = request["action"]
-        if intent.get("action") != action:
-            raise ValueError("Codex 玩家返回了错误的动作类型，请重试。")
-        allowed = request.get("allowed_targets", [])
-        required_target = {"wolf_kill", "charm", "guard", "divine", "sheriff_recommend", "mvp_vote"}
-        target_actions = required_target | {"vote", "witch_poison", "sheriff_transfer", "knight_decide"}
-        if action in target_actions:
-            target = intent.get("target")
-            if target is None and action in required_target:
-                raise ValueError("Codex 玩家没有选择必需的目标，请重试。")
-            if target is not None and target not in allowed:
-                raise ValueError("Codex 玩家选择了非法目标，请重试。")
-        if action in {"speech", "pk_speech", "campaign_speech", "last_words", "postgame_speech"} and not str(intent.get("text") or "").strip():
-            raise ValueError("Codex 玩家没有给出发言，请重试。")
-        if action == "mvp_vote" and not str(intent.get("text") or "").strip():
-            raise ValueError("Codex 玩家没有给出MVP票选理由，请重试。")
-        if action == "postgame_speech":
-            impressions = intent.get("player_impressions")
-            if not isinstance(impressions, list) or not 2 <= len(impressions) <= 4:
-                raise ValueError("赛后复盘需要评价2至4位特别选手")
-        if action == "campaign" and not isinstance(intent.get("join"), bool):
-            raise ValueError("Codex 玩家没有决定是否上警，请重试。")
-        if action == "withdraw" and not isinstance(intent.get("withdraw"), bool):
-            raise ValueError("Codex 玩家没有决定是否退水，请重试。")
-        if action == "witch_save" and not isinstance(intent.get("use"), bool):
-            raise ValueError("Codex 玩家没有决定是否使用解药，请重试。")
-        if action == "sheriff_order" and intent.get("direction") not in {"forward", "reverse"}:
-            raise ValueError("Codex 警长没有选择合法发言方向，请重试。")
+        payload = json.dumps(
+            {"request": request, "visible_state": visible_state},
+            ensure_ascii=False, separators=(",", ":"),
+        )
+        prompt = action_prompt(action) + (
+            "\n输出结构（必须严格遵守，未使用的字段填 null）：\n"
+            + json.dumps(action_schema(action), ensure_ascii=False, separators=(",", ":"))
+        )
+        full_prompt = f"{prompt}\n\n输入JSON：\n{payload}"
+        last_error = "未知错误"
+        for attempt in range(self.retries + 1):
+            attempt_prompt = full_prompt if attempt == 0 else (
+                f"{full_prompt}\n\n注意：上一次的返回不合法（{last_error}）。"
+                "这一次只输出一个符合上述结构的 JSON 对象，不要解释、不要 markdown 围栏。"
+            )
+            argv = self.backend.build_argv(
+                self.executable, self.model, self.extra_args,
+                prompt=attempt_prompt if self.backend.prompt_mode == "argv" else "",
+            )
+            raw = self._invoke(
+                argv, attempt_prompt if self.backend.prompt_mode == "stdin" else None
+            )
+            try:
+                intent = parse_action_payload(raw)
+                validate_intent(intent, request, f"{self.backend.label} 玩家")
+                return intent
+            except ValueError as exc:
+                last_error = str(exc)
+        raise ValueError(
+            f"{self.backend.label} 连续 {self.retries + 1} 次没有返回合法行动：{last_error}"
+        )
+
+    def _invoke(self, argv, stdin_text):
+        environment = os.environ.copy()
+        # Keep JSON prompts/replies lossless when a Python-based CLI inherits a
+        # legacy Windows console encoding (the game payload contains Chinese).
+        environment.setdefault("PYTHONUTF8", "1")
+        creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        try:
+            completed = subprocess.run(
+                argv,
+                input=stdin_text,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                capture_output=True,
+                timeout=self.timeout,
+                env=environment,
+                creationflags=creationflags,
+                check=False,
+            )
+        except FileNotFoundError as exc:
+            raise ValueError(f"无法启动 {self.backend.label}：{exc}") from exc
+        except subprocess.TimeoutExpired as exc:
+            raise ValueError(
+                f"{self.backend.label} 思考超过 {self.timeout} 秒，请重试或换更快的后端。"
+            ) from exc
+        if completed.returncode != 0:
+            raise ValueError(summarize_cli_error(
+                completed.stderr or completed.stdout or "", self.backend.label))
+        return completed.stdout or ""
+
+
+class ProviderFailure(ValueError):
+    """A failure that retrying will not fix: bad key, quota, unreachable host."""
+
+
+def summarize_api_error(status: int, body: str, label: str = "模型") -> str:
+    """Turn an OpenAI-compatible error response into one actionable line."""
+    detail = (body or "").strip()
+    message = detail[-300:]
+    try:
+        data = json.loads(detail)
+    except json.JSONDecodeError:
+        data = None
+    if isinstance(data, dict):
+        error = data.get("error")
+        if isinstance(error, dict) and error.get("message"):
+            message = str(error["message"])[:300]
+        elif isinstance(error, str) and error.strip():
+            message = error[:300]
+        elif data.get("message"):
+            message = str(data["message"])[:300]
+    lowered = f"{status} {detail}".lower()
+    if status in {401, 403} or any(token in lowered for token in _AUTH_HINTS):
+        return f"{label}的 API Key 无效或已过期（HTTP {status}），请检查 config/ai_config.json。原始提示：{message}"
+    if status == 429 or any(token in lowered for token in _QUOTA_HINTS):
+        return f"{label}的额度或频率已用尽（HTTP {status}），请稍后重试或换一个模型。原始提示：{message}"
+    return f"{label}调用失败（HTTP {status}）：{message}"
+
+
+def _clean(value: Any) -> str:
+    """Return the value unless it still looks like a config template."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    lowered = text.lower()
+    placeholders = ("your-api-key-here", "your-api-endpoint", "your_base_url",
+                    "sk-xxx", "changeme", "your-endpoint")
+    if any(token in lowered for token in placeholders):
+        return ""
+    return text
+
+
+def load_api_profile(name: Optional[str] = None, config_path: Optional[Path] = None,
+                     base_url: Optional[str] = None, api_key: Optional[str] = None,
+                     model: Optional[str] = None) -> Dict[str, Any]:
+    """Resolve one OpenAI-compatible endpoint.
+
+    Reads ``config/ai_config.json`` — the same file the original API simulator
+    used, so nothing has to be re-entered.  Explicit arguments and the
+    ``AIWOLF_BASE_URL`` / ``AIWOLF_API_KEY`` / ``AIWOLF_MODEL`` environment
+    variables all take precedence, so a key can be handed over without editing
+    the file at all.
+    """
+    path = Path(config_path) if config_path else Path(__file__).resolve().parents[1] / "config" / "ai_config.json"
+    players: Dict[str, Any] = {}
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{path} 不是合法的 JSON：{exc}") from exc
+        players = (data or {}).get("ai_players") or {}
+
+    explicit_base = _clean(base_url) or _clean(os.environ.get("AIWOLF_BASE_URL"))
+    explicit_key = _clean(api_key) or _clean(os.environ.get("AIWOLF_API_KEY"))
+    explicit_model = _clean(model) or _clean(os.environ.get("AIWOLF_MODEL"))
+
+    entry_name, entry = "", {}
+    if name:
+        matches = [(key, value) for key, value in players.items()
+                   if key.strip().lower() == str(name).strip().lower()]
+        if not matches:
+            available = ", ".join(players) or "（文件里没有 ai_players）"
+            raise ValueError(f"ai_config.json 里没有名为 {name} 的模型；可选 {available}")
+        entry_name, entry = matches[0]
+    else:
+        ready = [(key, value) for key, value in players.items()
+                 if _clean(value.get("api_key")) and _clean(value.get("baseurl"))]
+        if ready:
+            entry_name, entry = ready[0]
+        elif players and not (explicit_base and explicit_key and explicit_model):
+            # Only borrow the first entry when it can still contribute something;
+            # otherwise everything came from the command line and naming the
+            # profile after an unrelated file entry would just be misleading.
+            entry_name, entry = next(iter(players.items()))
+
+    resolved_base = explicit_base or _clean(entry.get("baseurl"))
+    resolved_key = explicit_key or _clean(entry.get("api_key"))
+    resolved_model = explicit_model or _clean(entry.get("model"))
+    if not resolved_base or not resolved_key:
+        raise ValueError(
+            "还没有可用的 API 配置。请把 config/ai_config.json 里某个条目的 baseurl 和 api_key "
+            "填成你自己的，或者用 --api-base-url / --api-key / --model 直接指定。"
+        )
+    if not resolved_model:
+        raise ValueError("缺少模型名称：请填写配置文件里的 model 字段，或用 --model 指定。")
+    try:
+        timeout = int(entry.get("timeout") or 0)
+    except (TypeError, ValueError):
+        timeout = 0
+    return {"name": entry_name or "自定义", "baseurl": resolved_base,
+            "api_key": resolved_key, "model": resolved_model, "timeout": timeout}
+
+
+class ApiProvider(ActionProvider):
+    """OpenAI-compatible chat completions, one fresh request per seat action.
+
+    Deliberately plain ``urllib`` rather than the ``openai`` package so the
+    panel gains no import-time dependency; the wire format is the one every
+    compatible vendor implements.  Like ``GenericCLIProvider`` it shares the
+    schema, the role prompt and the legality checks, and each call carries a
+    single seat's visible state so the eleven seats stay independent.
+    """
+
+    name = "api"
+    batch_actions = False
+
+    def __init__(self, base_url: str, api_key: str, model: str, timeout: int = 60,
+                 retries: int = 2, response_format: str = "json_object",
+                 label: str = "模型"):
+        self.base_url = str(base_url).rstrip("/")
+        self.api_key = api_key
+        self.model_name = model
+        self.timeout = max(5, int(timeout))
+        self.retries = max(0, int(retries))
+        self.response_format = response_format or "json_object"
+        self.label = label
+
+    def request_action(self, visible_state, request):
+        action = request["action"]
+        schema = action_schema(action)
+        system = action_prompt(action) + (
+            "\n输出结构（必须严格遵守，未使用的字段填 null）：\n"
+            + json.dumps(schema, ensure_ascii=False, separators=(",", ":"))
+        )
+        payload = json.dumps({"request": request, "visible_state": visible_state},
+                             ensure_ascii=False, separators=(",", ":"))
+        last_error = "未知错误"
+        for attempt in range(self.retries + 1):
+            user = payload if attempt == 0 else (
+                f"{payload}\n\n注意：上一次的返回不合法（{last_error}）。"
+                "这一次只输出一个符合上述结构的 JSON 对象，不要解释、不要 markdown 围栏。"
+            )
+            body = self._build_body(system, user, action)
+            status, text = self._post(body)
+            if status == 400 and "response_format" in text and self.response_format != "none":
+                self.response_format = "none"
+                status, text = self._post(self._build_body(system, user, action))
+            if status != 200:
+                raise ProviderFailure(
+                    summarize_api_error(status, text, f"{self.label}")
+                )
+            try:
+                content = self._extract_content(text)
+                intent = parse_action_payload(content)
+                validate_intent(intent, request, f"{self.label}")
+                return intent
+            except ProviderFailure:
+                raise
+            except ValueError as exc:
+                last_error = str(exc)
+        raise ValueError(
+            f"{self.label}连续 {self.retries + 1} 次没有返回合法行动：{last_error}"
+        )
+
+    def _build_body(self, system: str, user: str, action: str) -> Dict[str, Any]:
+        body: Dict[str, Any] = {
+            "model": self.model_name,
+            "messages": [{"role": "system", "content": system},
+                         {"role": "user", "content": user}],
+        }
+        if self.response_format == "json_object":
+            body["response_format"] = {"type": "json_object"}
+        elif self.response_format == "json_schema":
+            body["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {"name": "wolf_action", "strict": True,
+                                "schema": action_schema(action)},
+            }
+        return body
+
+    def _post(self, body: Dict[str, Any]):
+        data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        http_request = urllib.request.Request(
+            f"{self.base_url}/chat/completions",
+            data=data,
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "Authorization": f"Bearer {self.api_key}",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(http_request, timeout=self.timeout) as response:
+                return response.status, response.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.read().decode("utf-8", "replace")
+        except urllib.error.URLError as exc:
+            raise ProviderFailure(f"连不上 {self.base_url}：{exc.reason}") from exc
+        except TimeoutError as exc:
+            raise ProviderFailure(
+                f"{self.label}响应超过 {self.timeout} 秒，请重试或调大超时。") from exc
+
+    @staticmethod
+    def _extract_content(text: str) -> str:
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"接口返回的不是 JSON：{text[:200]}") from exc
+        if isinstance(data, dict) and data.get("error"):
+            error = data["error"]
+            message = error.get("message") if isinstance(error, dict) else error
+            raise ProviderFailure(f"接口返回错误：{str(message)[:200]}")
+        choices = data.get("choices") if isinstance(data, dict) else None
+        if not choices:
+            raise ValueError(f"接口没有返回 choices：{text[:200]}")
+        message = choices[0].get("message") or {}
+        content = message.get("content")
+        if isinstance(content, list):
+            content = "".join(part.get("text", "") for part in content
+                              if isinstance(part, dict))
+        if not str(content or "").strip():
+            raise ValueError("接口返回了空内容，请重试。")
+        return str(content)
+
+
+def split_cli_args(text: str) -> list:
+    """Split extra CLI arguments without mangling Windows paths.
+
+    ``shlex.split`` runs in POSIX mode by default, where a backslash is an
+    escape character, so ``--received-dir=C:\\temp`` would silently lose its
+    backslashes.  On Windows we therefore only honour double quotes.
+    """
+    if os.name != "nt":
+        return shlex.split(text)
+    return [token.strip('"') for token in re.findall(r'"[^"]*"|\S+', text)]
 
 
 def create_provider(name: str, bridge_root: Optional[Path] = None,
-                    model: Optional[str] = None) -> ActionProvider:
-    if name == "builtin":
-        return BuiltinAIProvider()
+                    model: Optional[str] = None, cli: Optional[str] = None,
+                    cli_args: Optional[str] = None, timeout: Optional[int] = None,
+                    retries: Optional[int] = None, api_model: Optional[str] = None,
+                    api_key: Optional[str] = None, api_base_url: Optional[str] = None,
+                    api_format: Optional[str] = None,
+                    api_config: Optional[Path] = None) -> ActionProvider:
     if name == "codex":
         if bridge_root is None:
             raise ValueError("Codex Provider 需要本地桥接目录")
         return CodexFileProvider(bridge_root)
+    if name == "cli":
+        selected_cli = cli or "codex"
+        if selected_cli == "codex":
+            return CodexCLIProvider(model=model, timeout=timeout or 180)
+        return GenericCLIProvider(
+            backend=selected_cli,
+            model=model,
+            timeout=timeout or 180,
+            retries=2 if retries is None else retries,
+            extra_args=split_cli_args(cli_args) if cli_args else None,
+        )
+    # Keep the old constructor spelling for callers that import this module
+    # directly.  The panel no longer exposes it as a separate mode.
     if name == "codex-cli":
-        return CodexCLIProvider(model=model)
+        return CodexCLIProvider(model=model, timeout=timeout or 180)
+    if name == "api":
+        profile = load_api_profile(api_model, api_config,
+                                   base_url=api_base_url, api_key=api_key, model=model)
+        return ApiProvider(
+            base_url=profile["baseurl"],
+            api_key=profile["api_key"],
+            model=profile["model"],
+            timeout=timeout or profile["timeout"] or 60,
+            retries=2 if retries is None else retries,
+            response_format=api_format or "json_object",
+            label=f"{profile['name']} 模型",
+        )
     raise ValueError(f"未知 AI Provider: {name}")

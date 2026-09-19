@@ -1,6 +1,7 @@
 """Bridge worker command line for the ``codex`` Provider.
 
-The interactive panel can run with ``--provider codex``: every computer action is
+The interactive panel can use the ``Codex 文件桥接`` mode selected in the setup page
+(or the advanced ``--provider codex`` command): every computer action is
 written to ``codex_bridge/tasks/<id>.json`` and the game safely pauses until a
 matching ``codex_bridge/responses/<id>.json`` appears. This tool is the worker
 side of that protocol.

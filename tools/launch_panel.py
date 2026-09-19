@@ -8,7 +8,7 @@ it detached from the current process group, writes stdout/stderr to
 Usage::
 
     python tools/launch_panel.py start --provider codex --reset
-    python tools/launch_panel.py start --provider builtin
+    python tools/launch_panel.py start --provider cli --cli ollama --model qwen3
     python tools/launch_panel.py status
     python tools/launch_panel.py stop
 """
@@ -23,6 +23,10 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from game.ai_providers import CLI_BACKEND_CHOICES
+
 LOG_DIR = ROOT / "logs"
 OUT_LOG = LOG_DIR / "panel_bridge.out.log"
 ERR_LOG = LOG_DIR / "panel_bridge.err.log"
@@ -103,6 +107,10 @@ def cmd_start(args: argparse.Namespace) -> int:
         "--port", str(args.port),
         "--provider", args.provider,
     ]
+    if args.provider == "cli":
+        command.extend(["--cli", args.cli])
+        if args.model:
+            command.extend(["--model", args.model])
     if args.open_browser:
         command.append("--open-browser")
     if args.reset:
@@ -134,7 +142,11 @@ def main() -> int:
 
     start = sub.add_parser("start")
     start.add_argument("--provider", default="codex",
-                       choices=["builtin", "codex", "codex-cli"])
+                       choices=["codex", "cli", "api"])
+    start.add_argument("--cli", default="codex", choices=CLI_BACKEND_CHOICES,
+                       help="--provider cli 时选择本地 CLI 后端")
+    start.add_argument("--model", default=None,
+                       help="--provider cli 时覆盖模型名称")
     start.add_argument("--port", type=int, default=0)
     start.add_argument("--reset", action="store_true")
     start.add_argument("--open-browser", action="store_true", default=True)

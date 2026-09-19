@@ -1,10 +1,32 @@
+import contextlib
 import json
+import os
+import sys
 import tempfile
+import threading
 import unittest
+import urllib.error
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
 
-from game.ai_providers import BuiltinAIProvider, CodexCLIProvider, CodexFileProvider
+from game.ai_providers import (
+    CLI_BACKENDS,
+    ApiProvider,
+    BuiltinAIProvider,
+    CliBackend,
+    CodexCLIProvider,
+    CodexFileProvider,
+    GenericCLIProvider,
+    ProviderFailure,
+    action_schema,
+    action_prompt,
+    load_api_profile,
+    parse_action_payload,
+    split_cli_args,
+    summarize_cli_error,
+    validate_intent,
+)
 from game.ai_profiles import (
     PROFILE_TEMPLATES,
     archive_completed_game,
@@ -25,11 +47,14 @@ from game.human_game import (
     _kill,
     _queue_complete,
     _resolve_night,
+    _resume,
     _start_day_vote,
     _start_sheriff_election,
     _start_sheriff_speeches,
     _start_sheriff_vote,
     _start_withdraw,
+    _start_mirror_wolf_chat,
+    _start_hidden_wolf_learn,
     _winner,
     create_game,
     get_visible_state,
@@ -38,6 +63,53 @@ from game.human_game import (
 from game.roles import Villager, Werewolf
 from game.visibility import get_legacy_visible_state
 import panel_game
+
+
+STUB_CLI_SOURCE = '''
+import json
+import os
+import sys
+
+raw = sys.stdin.read()
+directory = None
+for token in sys.argv:
+    if token.startswith("--received-dir="):
+        directory = token.split("=", 1)[1]
+if directory:
+    os.makedirs(directory, exist_ok=True)
+    name = "call_%03d.json" % len(os.listdir(directory))
+    with open(os.path.join(directory, name), "w", encoding="utf-8") as handle:
+        handle.write(raw)
+
+payload = json.loads(raw[raw.rindex(chr(123) + chr(34) + "request"):])
+request = payload["request"]
+action = request["action"]
+targets = list(request.get("allowed_targets", []))
+intent = {"action": action, "target": None, "text": None, "join": None,
+          "withdraw": None, "use": None, "direction": None, "player_impressions": None}
+if action == "postgame_speech":
+    intent["text"] = "我复盘一下这局的判断。"
+    intent["player_impressions"] = [{"seat": seat, "impression": "关键轮次表现稳定。"}
+                                    for seat in (1, 2)]
+elif action == "mvp_vote":
+    intent["target"] = targets[0] if targets else 1
+    intent["text"] = "关键轮次贡献最直接。"
+elif action in {"speech", "pk_speech", "campaign_speech", "last_words"}:
+    intent["text"] = "我按公开发言和票型判断，先不急着站边。"
+elif action == "campaign":
+    intent["join"] = False
+elif action == "withdraw":
+    intent["withdraw"] = False
+elif action == "witch_save":
+    intent["use"] = False
+elif action == "sheriff_order":
+    intent["direction"] = "forward"
+elif action == "knight_decide":
+    intent["target"] = None
+else:
+    intent["target"] = targets[0] if targets else None
+print(json.dumps(intent, ensure_ascii=False))
+'''
 
 
 class QuietElectionProvider(BuiltinAIProvider):
@@ -57,6 +129,12 @@ class KnightStrikeProvider(QuietElectionProvider):
         if request["action"] == "knight_decide":
             return {"action": "knight_decide", "target": self.target}
         return super().request_action(visible_state, request)
+
+
+class CliNamedStrikeProvider(KnightStrikeProvider):
+    """Same brain as the builtin AI, but carrying the generic CLI provider's name."""
+
+    name = "cli"
 
 
 def human_intent(state):
@@ -98,7 +176,146 @@ def drive(state, *, stop=None, limit=1000):
     raise AssertionError(f"对局未在{limit}步内完成，当前阶段={state['phase']}")
 
 
+class StubOpenAIHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        raw = self.rfile.read(length).decode("utf-8")
+        entry = {"path": self.path, "auth": self.headers.get("Authorization"),
+                 "body": json.loads(raw)}
+        self.server.requests.append(entry)
+        status, payload = self.server.responder(entry)
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+@contextlib.contextmanager
+def stub_openai(responder):
+    server = ThreadingHTTPServer(("127.0.0.1", 0), StubOpenAIHandler)
+    server.requests = []
+    server.responder = responder
+    threading.Thread(target=lambda: server.serve_forever(poll_interval=0.02),
+                     daemon=True).start()
+    # urllib honours *_proxy, and this machine has a proxy that intercepts even
+    # 127.0.0.1; bypass it so the stub is hit directly instead of through it.
+    bypass = {"no_proxy": "127.0.0.1,localhost", "NO_PROXY": "127.0.0.1,localhost"}
+    try:
+        with patch.dict(os.environ, bypass):
+            yield server, f"http://127.0.0.1:{server.server_address[1]}/v1"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def chat_reply(content):
+    return {"choices": [{"message": {"role": "assistant", "content": content}}]}
+
+
+def stub_intent_for(request):
+    """A legal action for any request, mirroring the CLI stub."""
+    action = request["action"]
+    targets = list(request.get("allowed_targets", []))
+    intent = {"action": action, "target": None, "text": None, "join": None,
+              "withdraw": None, "use": None, "direction": None, "player_impressions": None}
+    if action == "postgame_speech":
+        intent["text"] = "我复盘一下这局的判断。"
+        intent["player_impressions"] = [{"seat": seat, "impression": "关键轮次表现稳定。"}
+                                        for seat in (1, 2)]
+    elif action == "mvp_vote":
+        intent["target"] = targets[0] if targets else 1
+        intent["text"] = "关键轮次贡献最直接。"
+    elif action in {"speech", "pk_speech", "campaign_speech", "last_words"}:
+        intent["text"] = "我按公开发言和票型判断，先不急着站边。"
+    elif action == "wolf_chat":
+        intent["text"] = "今晚我倾向处理带队位置，白天注意别站得太整齐。"
+    elif action == "campaign":
+        intent["join"] = False
+    elif action == "withdraw":
+        intent["withdraw"] = False
+    elif action == "witch_save":
+        intent["use"] = False
+    elif action == "sheriff_order":
+        intent["direction"] = "forward"
+    elif action == "knight_decide":
+        intent["target"] = None
+    else:
+        intent["target"] = targets[0] if targets else None
+    return intent
+
+
 class HumanGameTests(unittest.TestCase):
+    def test_panel_provider_modes_are_three_and_saved_without_secrets(self):
+        self.assertEqual(panel_game.normalize_provider_config({"provider": "cli", "cli": "codex"}),
+                         {"mode": "cli", "cli": "codex", "model": None})
+        self.assertEqual(panel_game.normalize_provider_config(
+            {"provider": "cli", "cli": "codex", "model": None}),
+            {"mode": "cli", "cli": "codex", "model": None})
+        self.assertEqual(panel_game.normalize_provider_config({"provider": "codex"}),
+                         {"mode": "bridge"})
+        self.assertEqual(panel_game.normalize_provider_config({"provider": "api", "api_model": "DEEPSEEK"}),
+                         {"mode": "api", "api_model": "DEEPSEEK", "api_format": "json_object"})
+        with self.assertRaises(ValueError):
+            panel_game.normalize_provider_config({"provider": "builtin"})
+
+    def test_panel_start_game_applies_selected_bridge_provider(self):
+        old_engine, old_config, old_root = panel_game.ENGINE, panel_game.ACTIVE_PROVIDER_CONFIG, panel_game.BRIDGE_ROOT
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                panel_game.BRIDGE_ROOT = Path(directory)
+                state = panel_game.apply_action(
+                    panel_game.setup_state(),
+                    {"action": "start_game", "provider": "bridge", "human_seat": "1",
+                     "debug_role": "villager", "board": "classic"},
+                )
+                self.assertEqual(state["provider_config"], {"mode": "bridge"})
+                self.assertEqual(panel_game.ENGINE.provider.name, "codex")
+        finally:
+            panel_game.ENGINE, panel_game.ACTIVE_PROVIDER_CONFIG, panel_game.BRIDGE_ROOT = (
+                old_engine, old_config, old_root
+            )
+
+    def test_panel_real_mode_forces_random_setup_and_self_kill(self):
+        old_engine, old_config = panel_game.ENGINE, panel_game.ACTIVE_PROVIDER_CONFIG
+        original_create_game = panel_game.create_game
+        try:
+            with patch("panel_game.create_game", side_effect=original_create_game) as factory:
+                state = panel_game.apply_action(
+                    panel_game.setup_state(),
+                    {"action": "start_game", "game_mode": "real", "human_seat": "7",
+                     "debug_role": "seer", "board": "classic", "provider": "cli", "cli": "codex"},
+                )
+                args = factory.call_args.args
+                self.assertEqual(args[0], 0)
+                self.assertEqual(args[1], "random")
+                self.assertTrue(args[3])
+                self.assertEqual(state["game_mode"], "real")
+                self.assertTrue(state["rules"]["wolf_can_self_kill"])
+        finally:
+            panel_game.ENGINE, panel_game.ACTIVE_PROVIDER_CONFIG = old_engine, old_config
+
+    def test_panel_test_mode_keeps_selected_setup(self):
+        old_engine, old_config = panel_game.ENGINE, panel_game.ACTIVE_PROVIDER_CONFIG
+        try:
+            state = panel_game.apply_action(
+                panel_game.setup_state(),
+                {"action": "start_game", "game_mode": "test", "human_seat": "7",
+                 "debug_role": "seer", "board": "classic", "provider": "cli", "cli": "codex"},
+            )
+            self.assertEqual(state["game_mode"], "test")
+            self.assertEqual(state["human_seat"], 7)
+            self.assertEqual(state["roles"]["7"], "seer")
+            self.assertTrue(state["rules"]["wolf_can_self_kill"])
+        finally:
+            panel_game.ENGINE, panel_game.ACTIVE_PROVIDER_CONFIG = old_engine, old_config
+
     def test_existing_schema_two_save_gets_new_candidate_field(self):
         state = create_game(1, "villager", seed=2)
         state.pop("sheriff_candidates")
@@ -164,6 +381,57 @@ class HumanGameTests(unittest.TestCase):
             self.assertEqual(sum(role in WOLF_ROLES for role in roles), 4)
             self.assertEqual(sum(role in GOD_ROLES for role in roles), 4)
             self.assertEqual(roles.count("villager"), 4)
+
+    def test_small_wolf_can_explode_during_any_day_speech(self):
+        state = create_game(1, "werewolf", seed=41)
+        state["day"] = 2
+        state["phase"] = "day_speech"
+        state["phase_data"] = {}
+        state["pending"] = {"actor": 8, "action": "speech", "allowed_targets": [], "sequence": 1}
+        public = public_state_for_human(state)
+        self.assertTrue(public["can_wolf_explode"])
+        HumanGameEngine(BuiltinAIProvider()).submit_human(state, {"action": "wolf_explode"})
+        self.assertFalse(state["players"]["1"]["alive"])
+        self.assertEqual(state["players"]["1"]["revealed_role"], "werewolf")
+        self.assertEqual(state["phase"], "night_wolf_chat")
+        self.assertTrue(any("自爆" in event["text"] for event in state["history"]))
+
+    def test_only_small_wolf_can_explode(self):
+        state = create_game(1, "wolf_beauty", seed=42)
+        state["day"] = 2
+        state["phase"] = "day_speech"
+        self.assertFalse(public_state_for_human(state)["can_wolf_explode"])
+        state = create_game(1, "villager", seed=43)
+        state["day"] = 2
+        state["phase"] = "day_speech"
+        self.assertFalse(public_state_for_human(state)["can_wolf_explode"])
+
+    def test_first_sheriff_speech_explosion_delays_election(self):
+        state = create_game(1, "werewolf", seed=44)
+        state["day"] = 1
+        state["phase"] = "sheriff_speech"
+        state["phase_data"] = {"candidates": [1, 2]}
+        HumanGameEngine(BuiltinAIProvider()).submit_human(state, {"action": "wolf_explode"})
+        self.assertTrue(state["sheriff_election_delayed"])
+        self.assertTrue(state["sheriff_badge"])
+        self.assertEqual(state["phase"], "night_wolf_chat")
+        state["day"] = 2
+        _resume(state, "post_night")
+        self.assertEqual(state["phase"], "sheriff_campaign")
+        self.assertEqual(state["sheriff_candidates"], [])
+
+    def test_second_day_sheriff_speech_explosion_consumes_badge(self):
+        state = create_game(1, "werewolf", seed=45)
+        state["day"] = 2
+        state["phase"] = "sheriff_speech"
+        state["phase_data"] = {"candidates": [1, 2]}
+        HumanGameEngine(BuiltinAIProvider()).submit_human(state, {"action": "wolf_explode"})
+        self.assertFalse(state["sheriff_badge"])
+        self.assertIsNone(state["sheriff"])
+        self.assertFalse(state["sheriff_election_delayed"])
+        self.assertEqual(state["phase"], "night_wolf_chat")
+        _resume(state, "post_night")
+        self.assertEqual(state["phase"], "day_speech")
 
     def test_random_human_seat_is_not_fixed(self):
         seats = {create_game(0, "random", seed=seed)["human_seat"] for seed in range(20)}
@@ -545,6 +813,47 @@ class HumanGameTests(unittest.TestCase):
         self.assertEqual(seer["phase"], "sheriff_campaign")
         self.assertEqual(seer["pending"]["actor"], 1)
 
+    def test_slow_provider_advances_one_night_action_and_waits_for_human(self):
+        class SlowProvider(BuiltinAIProvider):
+            batch_actions = False
+            calls = 0
+
+            def request_action(self, view, request):
+                self.calls += 1
+                return super().request_action(view, request)
+
+        provider = SlowProvider()
+        state = create_game(1, "seer", seed=4)
+        engine = HumanGameEngine(provider)
+        sequence = state["action_seq"]
+        engine.advance_ai(state)
+        self.assertEqual(provider.calls, 1)
+        self.assertEqual(state["action_seq"], sequence + 1)
+        for _ in range(30):
+            if state["pending"]["actor"] == 1:
+                break
+            engine.advance_ai(state)
+        self.assertEqual(state["pending"]["action"], "divine")
+        calls = provider.calls
+        engine.submit_human(state, {"action": "divine", "target": state["pending"]["allowed_targets"][0]})
+        self.assertEqual(provider.calls, calls)
+        with patch.object(panel_game, "ENGINE", engine, create=True):
+            self.assertTrue(panel_game.panel_state(state)["auto_continue"])
+
+    def test_slow_provider_secret_votes_stay_hidden_between_requests(self):
+        class SlowProvider(BuiltinAIProvider):
+            batch_actions = False
+
+        state = create_game(1, "villager", seed=4)
+        _start_sheriff_election(state)
+        engine = HumanGameEngine(SlowProvider())
+        engine.submit_human(state, {"action": "campaign", "join": False})
+        engine.advance_ai(state)
+        self.assertFalse(state["phase_data"]["published"])
+        self.assertEqual(public_state_for_human(state)["public_votes"], {})
+        with patch.object(panel_game, "ENGINE", engine, create=True):
+            self.assertTrue(panel_game.panel_state(state)["auto_continue"])
+
     def test_withdraw_results_publish_together(self):
         state = create_game(1, "villager", seed=7)
         state["sheriff_election_players"] = [1, 2, 3]
@@ -690,6 +999,68 @@ class HumanGameTests(unittest.TestCase):
         self.assertTrue(state["mvp_result"]["winners"])
         self.assertIsNone(state["pending"])
 
+    def test_visible_state_never_leaks_a_role_it_should_not(self):
+        """The project's central invariant, checked for every seat at every phase.
+
+        The bridge and the CLI providers both trust ``get_visible_state``
+        completely, so a single leak here would hand the whole identity table to
+        every AI player.  Driving complete games and inspecting all twelve seats
+        after every step is the cheapest way to keep that trust honest.
+        """
+        secret_keys = {"abilities", "night", "roles", "ai_memories", "ai_profiles",
+                       "postgame_impressions", "mvp_votes", "wolf_chat", "phase_data"}
+        private_by_role = {
+            "seer": {"seer_checks"},
+            "witch": {"medicine", "poison", "tonight_wolf_target"},
+            "guard": {"last_guarded"},
+            "knight": {"duel_available"},
+            "wolf_beauty": {"charmed_player"},
+        }
+        checked = 0
+        for seed in range(6):
+            state = create_game(0, "random", seed=seed)
+            engine = HumanGameEngine(BuiltinAIProvider())
+            for _ in range(1500):
+                if state["phase"] == "game_over":
+                    break
+                roles = {int(seat): role for seat, role in state["roles"].items()}
+                wolves = {seat for seat, role in roles.items() if role in WOLF_ROLES}
+                revealed = state["winner"] is not None
+                for seat in range(1, 13):
+                    checked += 1
+                    view = get_visible_state(state, seat)
+                    label = f"seed={seed} phase={state['phase']} seat={seat}"
+
+                    self.assertFalse(secret_keys & set(view), f"{label} 顶层出现隐藏字段")
+
+                    allowed_private = set()
+                    if roles[seat] in WOLF_ROLES:
+                        allowed_private |= {"wolf_teammates", "wolf_chat"}
+                    allowed_private |= private_by_role.get(roles[seat], set())
+                    self.assertLessEqual(set(view["private"]), allowed_private,
+                                         f"{label} private 越界")
+
+                    if revealed:
+                        expected = set(range(1, 13))
+                    elif roles[seat] in WOLF_ROLES:
+                        expected = wolves
+                    else:
+                        expected = {seat}
+                    expected |= {player["seat"] for player in view["players"]
+                                 if player.get("revealed_role")}
+                    known = {player["seat"] for player in view["players"] if player.get("role")}
+                    self.assertLessEqual(known, expected, f"{label} 看到了不该知道的身份")
+
+                    for event in view["history"]:
+                        self.assertNotIn("role", event, f"{label} history 夹带 role")
+                        self.assertNotIn("is_wolf", event, f"{label} history 夹带 is_wolf")
+
+                if state["pending"]["actor"] == state["human_seat"]:
+                    engine.submit_human(state, human_intent(state))
+                else:
+                    engine.advance_ai(state)
+        self.assertGreater(checked, 3000)
+
     def test_codex_bridge_task_contains_only_visible_state(self):
         state = create_game(1, "villager", seed=3)
         actor = state["pending"]["actor"]
@@ -728,10 +1099,17 @@ class HumanGameTests(unittest.TestCase):
 
         self.assertEqual(intent["action"], request["action"])
         sent = run.call_args.kwargs["input"]
+        command = run.call_args.args[0]
+        self.assertIn("--model", command)
+        self.assertNotEqual(command[command.index("--model") + 1], "None")
         self.assertNotIn('"roles"', sent)
         self.assertIn('"visible_state"', sent)
         self.assertIn("--ephemeral", run.call_args.args[0])
         self.assertIn("--ignore-user-config", run.call_args.args[0])
+        self.assertEqual(
+            run.call_args.kwargs["env"]["CODEX_HOME"],
+            str(Path.home() / ".codex"),
+        )
 
     def test_invalid_human_action_does_not_corrupt_state(self):
         state = create_game(2, "seer", seed=19)
@@ -759,6 +1137,635 @@ class HumanGameTests(unittest.TestCase):
         self.assertNotIn("role", view["current_discussion"][0])
         self.assertNotIn("target_role", view["history"][0])
         self.assertFalse(any(item.get("event") == "seer_check" for item in view["history"]))
+
+
+    def test_cli_backends_build_expected_argv(self):
+        ollama = CLI_BACKENDS["ollama"]
+        self.assertEqual(ollama.build_argv("ollama", "qwen3"),
+                         ["ollama", "run", "qwen3", "--format", "json"])
+        self.assertEqual(ollama.build_argv("ollama", None),
+                         ["ollama", "run", "qwen3", "--format", "json"])
+
+        claude = CLI_BACKENDS["claude"]
+        self.assertEqual(
+            claude.build_argv("claude.cmd", "claude-sonnet-4-5", extra_args=["--foo"]),
+            ["claude.cmd", "--model", "claude-sonnet-4-5",
+             "-p", "--output-format", "json", "--max-turns", "1", "--foo"],
+        )
+        self.assertEqual(
+            claude.build_argv("claude.cmd", None),
+            ["claude.cmd", "-p", "--output-format", "json", "--max-turns", "1"],
+        )
+
+        gemini = CLI_BACKENDS["gemini"]
+        self.assertEqual(gemini.build_argv("gemini", None, prompt="你好"),
+                         ["gemini", "-p", "你好"])
+
+        model_less = CliBackend(key="x", label="X", executables=("x",),
+                                template=("run", "{model}"), prompt_mode="stdin")
+        with self.assertRaises(ValueError):
+            model_less.build_argv("x")
+        with self.assertRaises(ValueError):
+            CliBackend(key="y", label="Y", executables=("y",),
+                       template=("go",), prompt_mode="argv")
+        with self.assertRaises(ValueError):
+            CliBackend(key="z", label="Z", executables=("z",),
+                       template=("go", "{prompt}"), prompt_mode="stdin")
+
+    def test_cli_backends_only_ever_reuse_the_codex_schema(self):
+        for action in ["vote", "wolf_kill", "speech", "postgame_speech", "mvp_vote"]:
+            self.assertEqual(action_schema(action)["properties"]["action"]["const"], action)
+        schema = action_schema("speech")
+        self.assertFalse(schema["additionalProperties"])
+        self.assertIn("player_impressions", schema["required"])
+
+    def test_cli_output_parsing_handles_envelopes_and_fences(self):
+        intent = {"action": "speech", "text": "我先听一圈。", "target": None}
+        self.assertEqual(parse_action_payload(json.dumps(intent, ensure_ascii=False)), intent)
+
+        envelope = {"type": "result", "is_error": False,
+                    "result": json.dumps(intent, ensure_ascii=False)}
+        self.assertEqual(parse_action_payload(json.dumps(envelope, ensure_ascii=False)), intent)
+
+        fenced = ("好的，我的决定如下：\n```json\n"
+                  f"{json.dumps(intent, ensure_ascii=False)}\n```\n以上。")
+        self.assertEqual(parse_action_payload(fenced), intent)
+
+        with self.assertRaises(ValueError):
+            parse_action_payload("我今天不想发言。")
+        with self.assertRaises(ValueError):
+            parse_action_payload("")
+
+    def test_generic_cli_provider_retries_and_keeps_seat_isolation(self):
+        state = create_game(1, "villager", seed=3)
+        actor = state["pending"]["actor"]
+        request = state["pending"]
+        view = get_visible_state(state, actor)
+
+        good = {"action": request["action"], "target": None, "text": "今晚先观察警上位置。",
+                "join": None, "withdraw": None, "use": None, "direction": None,
+                "player_impressions": None}
+        replies = ["抱歉，我还需要再想一想。", json.dumps(good, ensure_ascii=False)]
+        captured = []
+
+        with patch("game.ai_providers.shutil.which", return_value="ollama.exe"):
+            provider = GenericCLIProvider(backend="ollama", model="qwen3", retries=1)
+
+        def fake_invoke(argv, stdin_text):
+            captured.append((argv, stdin_text))
+            return replies.pop(0)
+
+        with patch.object(GenericCLIProvider, "_invoke", side_effect=fake_invoke):
+            intent = provider.request_action(view, request)
+
+        self.assertEqual(intent["action"], request["action"])
+        self.assertEqual(len(captured), 2)
+        self.assertEqual(captured[0][0][:2], ["ollama.exe", "run"])
+        self.assertNotIn('"roles"', captured[0][1])
+        self.assertIn('"visible_state"', captured[0][1])
+        self.assertIn('"player_impressions"', captured[0][1])
+        self.assertIn("不合法", captured[1][1])
+
+    def test_generic_cli_provider_rejects_illegal_target_after_retries(self):
+        view = {"game_id": "t", "day": 1, "phase": "day_vote", "self": {"seat": 2}}
+        request = {"actor": 2, "action": "vote", "allowed_targets": [3, 4], "prompt": "投票"}
+        with patch("game.ai_providers.shutil.which", return_value="ollama.exe"):
+            provider = GenericCLIProvider(backend="ollama", retries=1)
+        with patch.object(GenericCLIProvider, "_invoke",
+                          return_value=json.dumps({"action": "vote", "target": 99})):
+            with self.assertRaises(ValueError) as caught:
+                provider.request_action(view, request)
+        self.assertIn("连续 2 次", str(caught.exception))
+
+        with self.assertRaises(ValueError):
+            validate_intent({"action": "vote", "target": 99}, request)
+        validate_intent({"action": "vote", "target": 3}, request)
+
+    def test_cli_args_split_keeps_windows_paths_intact(self):
+        self.assertEqual(split_cli_args("--temperature 0.8"),
+                         ["--temperature", "0.8"])
+        self.assertEqual(split_cli_args('--name "hello world"'),
+                         ["--name", "hello world"])
+        if os.name == "nt":
+            windows_path = r"--received-dir=C:\Users\me\AppData\Local\Temp"
+            self.assertEqual(split_cli_args(windows_path), [windows_path])
+        else:
+            self.assertEqual(split_cli_args("--dir /tmp/a"), ["--dir", "/tmp/a"])
+
+    def test_cli_failures_are_reported_concisely(self):
+        echoed = (
+            "当前优先看2号，其次看5、9、10这些昨天站6、后续身份增量不足的位置。"
+            '}],"votes":[{"day":1,"target":6,"phase":"sheriff_vote"}],"winner":null}}\n'
+            "</stdin>\n"
+            "ERROR: You've hit your usage limit. Upgrade to Plus to continue using Codex "
+            "(https://chatgpt.com/explore/plus), or try again at Oct 17th, 2026 11:28 AM.\n"
+        )
+        message = summarize_cli_error(echoed, "Codex 玩家")
+        self.assertIn("额度或频率已用尽", message)
+        self.assertIn("usage limit", message)
+        self.assertNotIn('"votes"', message)
+        self.assertLess(len(message), 400)
+
+        self.assertIn("未登录或凭据已失效",
+                      summarize_cli_error("ERROR: 401 Unauthorized: invalid api key", "Ollama"))
+
+        other = summarize_cli_error("ERROR: unexpected argument '--format' found", "Ollama")
+        self.assertIn("调用失败", other)
+        self.assertIn("--format", other)
+
+        self.assertIn("没有输出任何错误信息", summarize_cli_error("", "Ollama"))
+
+    def test_codex_initialization_access_denied_has_restart_guidance(self):
+        for detail in (
+            "Error: failed to initialize in-process app-server client: 拒绝访问。 (os error 5)",
+            "Error: failed to initialize in-process app-server client: Access is denied. (os error 5)",
+        ):
+            message = summarize_cli_error(detail, "Codex 玩家")
+            self.assertIn("Windows 拒绝访问", message)
+            self.assertIn("启动狼人杀.bat", message)
+            self.assertIn("存档保留", message)
+            self.assertNotIn("额度", message)
+
+    def test_api_provider_sends_isolated_prompt_and_validates_reply(self):
+        state = create_game(1, "villager", seed=3)
+        actor = state["pending"]["actor"]
+        request = state["pending"]
+        view = get_visible_state(state, actor)
+        good = stub_intent_for(request)
+
+        def responder(entry):
+            return 200, chat_reply(json.dumps(good, ensure_ascii=False))
+
+        with stub_openai(responder) as (server, base_url):
+            provider = ApiProvider(base_url=base_url, api_key="test-key",
+                                   model="stub-model", label="测试模型")
+            intent = provider.request_action(view, request)
+
+        self.assertEqual(intent["action"], request["action"])
+        self.assertEqual(len(server.requests), 1)
+        sent = server.requests[0]
+        self.assertEqual(sent["path"], "/v1/chat/completions")
+        self.assertEqual(sent["auth"], "Bearer test-key")
+        self.assertEqual(sent["body"]["model"], "stub-model")
+        self.assertEqual(sent["body"]["response_format"], {"type": "json_object"})
+        roles = [message["role"] for message in sent["body"]["messages"]]
+        self.assertEqual(roles, ["system", "user"])
+        everything = "".join(message["content"] for message in sent["body"]["messages"])
+        self.assertIn('"visible_state"', everything)
+        self.assertIn('"player_impressions"', everything)
+        self.assertNotIn('"roles"', everything)
+
+    def test_api_provider_retries_and_downgrades_response_format(self):
+        state = create_game(1, "villager", seed=3)
+        actor = state["pending"]["actor"]
+        request = state["pending"]
+        view = get_visible_state(state, actor)
+        good = stub_intent_for(request)
+
+        def responder(entry):
+            body = entry["body"]
+            fmt = body.get("response_format") or {}
+            if fmt.get("type") == "json_schema":
+                return 400, {"error": {"message": "response_format json_schema is not supported"}}
+            if "不合法" not in body["messages"][-1]["content"]:
+                return 200, chat_reply("抱歉，我还需要想一想。")
+            return 200, chat_reply(json.dumps(good, ensure_ascii=False))
+
+        with stub_openai(responder) as (server, base_url):
+            provider = ApiProvider(base_url=base_url, api_key="k", model="m",
+                                   retries=1, response_format="json_schema")
+            intent = provider.request_action(view, request)
+
+        self.assertEqual(intent["action"], request["action"])
+        self.assertEqual(len(server.requests), 3)
+        self.assertEqual(server.requests[0]["body"]["response_format"]["type"], "json_schema")
+        self.assertNotIn("response_format", server.requests[1]["body"])
+        self.assertIn("不合法", server.requests[2]["body"]["messages"][-1]["content"])
+
+    def test_api_provider_maps_auth_and_quota_errors_without_retrying(self):
+        state = create_game(1, "villager", seed=3)
+        actor = state["pending"]["actor"]
+        request = state["pending"]
+        view = get_visible_state(state, actor)
+
+        for status, payload, expected in (
+            (401, {"error": {"message": "Invalid API key provided"}}, "API Key 无效"),
+            (429, {"error": {"message": "You exceeded your current quota"}}, "额度或频率已用尽"),
+        ):
+            with self.subTest(status=status):
+                with stub_openai(lambda entry, s=status, p=payload: (s, p)) as (server, base_url):
+                    provider = ApiProvider(base_url=base_url, api_key="k", model="m", retries=2)
+                    with self.assertRaises(ProviderFailure) as caught:
+                        provider.request_action(view, request)
+                self.assertIn(expected, str(caught.exception))
+                self.assertEqual(len(server.requests), 1)
+
+    def test_api_provider_reports_unreachable_endpoint(self):
+        state = create_game(1, "villager", seed=3)
+        actor = state["pending"]["actor"]
+        view = get_visible_state(state, actor)
+        request = state["pending"]
+        provider = ApiProvider(base_url="http://127.0.0.1:9/v1", api_key="k", model="m",
+                               retries=2)
+
+        with patch("game.ai_providers.urllib.request.urlopen",
+                   side_effect=urllib.error.URLError("connection refused")):
+            with self.assertRaises(ProviderFailure) as caught:
+                provider.request_action(view, request)
+        self.assertIn("连不上", str(caught.exception))
+
+        with patch("game.ai_providers.urllib.request.urlopen",
+                   side_effect=TimeoutError("timed out")):
+            with self.assertRaises(ProviderFailure) as caught:
+                provider.request_action(view, request)
+        self.assertIn("超过", str(caught.exception))
+
+    def test_api_provider_can_drive_a_whole_game_offline(self):
+        """Every action type survives the provider contract; HTTP shape is covered above."""
+        calls = []
+
+        def fake_post(body):
+            calls.append(body)
+            user = body["messages"][-1]["content"]
+            payload = json.loads(user[user.index('{"request"'):])
+            intent = stub_intent_for(payload["request"])
+            return 200, json.dumps(chat_reply(json.dumps(intent, ensure_ascii=False)),
+                                   ensure_ascii=False)
+
+        provider = ApiProvider(base_url="http://stub/v1", api_key="k", model="m", retries=0)
+        with patch.object(ApiProvider, "_post", side_effect=fake_post):
+            state = create_game(7, "villager", seed=4)
+            engine = HumanGameEngine(provider)
+            for _ in range(1500):
+                if state["phase"] == "game_over":
+                    break
+                if state["pending"]["actor"] == state["human_seat"]:
+                    engine.submit_human(state, human_intent(state))
+                else:
+                    engine.advance_ai(state)
+
+        self.assertIn(state["winner"], {"好人阵营", "狼人阵营"})
+        self.assertGreater(len(calls), 50)
+        for body in calls:
+            everything = "".join(message["content"] for message in body["messages"])
+            self.assertIn('"visible_state"', everything)
+            self.assertNotIn('"roles"', everything)
+
+    def test_load_api_profile_prefers_overrides_over_placeholder_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "ai_config.json"
+            path.write_text(json.dumps({"ai_players": {"DEEPSEEK": {
+                "baseurl": "https://your-api-endpoint.com/v1",
+                "api_key": "your-api-key-here",
+                "model": "deepseek-chat",
+            }}}, ensure_ascii=False), encoding="utf-8")
+
+            with self.assertRaises(ValueError) as caught:
+                load_api_profile(None, path)
+            self.assertIn("还没有可用的 API 配置", str(caught.exception))
+
+            profile = load_api_profile(None, path, base_url="https://real.example/v1",
+                                       api_key="sk-real", model="deepseek-reasoner")
+            self.assertEqual(profile["baseurl"], "https://real.example/v1")
+            self.assertEqual(profile["api_key"], "sk-real")
+            self.assertEqual(profile["model"], "deepseek-reasoner")
+
+            path.write_text(json.dumps({"ai_players": {"X": {
+                "baseurl": "", "api_key": "", "model": ""}}}, ensure_ascii=False),
+                encoding="utf-8")
+            with self.assertRaises(ValueError) as caught:
+                load_api_profile(None, path, base_url="https://real.example/v1",
+                                 api_key="sk-real")
+            self.assertIn("缺少模型名称", str(caught.exception))
+
+            path.write_text(json.dumps({"ai_players": {"DEEPSEEK": {
+                "baseurl": "https://api.deepseek.com/v1",
+                "api_key": "sk-real",
+                "model": "deepseek-chat",
+                "timeout": 42,
+            }}}, ensure_ascii=False), encoding="utf-8")
+            profile = load_api_profile("deepseek", path)
+            self.assertEqual(profile["name"], "DEEPSEEK")
+            self.assertEqual(profile["model"], "deepseek-chat")
+            self.assertEqual(profile["timeout"], 42)
+
+            profile = load_api_profile(None, path)
+            self.assertEqual(profile["name"], "DEEPSEEK")
+
+            with self.assertRaises(ValueError) as caught:
+                load_api_profile("NOPE", path)
+            self.assertIn("没有名为 NOPE", str(caught.exception))
+
+    def test_api_provider_requires_a_filled_key_in_the_real_config(self):
+        with self.assertRaises(ValueError) as caught:
+            load_api_profile(None)
+        self.assertIn("还没有可用的 API 配置", str(caught.exception))
+
+    def test_unknown_cli_backend_raises_a_readable_error(self):
+        with patch("game.ai_providers.shutil.which", return_value="x.exe"):
+            with self.assertRaises(ValueError) as caught:
+                GenericCLIProvider(backend="not-a-cli")
+        self.assertIn("未知 CLI 后端", str(caught.exception))
+
+    def test_generic_cli_provider_name_keeps_ai_knight_duel_enabled(self):
+        state = create_game(1, "villager", seed=11)
+        knight = next(int(seat) for seat, role in state["roles"].items() if role == "knight")
+        wolf = next(int(seat) for seat, role in state["roles"].items() if role in WOLF_ROLES)
+        self.assertNotEqual(knight, state["human_seat"])
+        self.assertEqual(GenericCLIProvider.name, "cli")
+        state["day"] = 1
+        _begin_speech_queue(state, "forward")
+        HumanGameEngine(CliNamedStrikeProvider(wolf)).submit_human(
+            state, {"action": "speech", "text": "我发言完了，骑士可以自行判断。"}
+        )
+        self.assertFalse(state["players"][str(wolf)]["alive"])
+        self.assertTrue(state["abilities"]["knight_used"])
+
+
+    def _install_stub_cli(self, directory: Path) -> Path:
+        """Put a fake CLI on PATH so the provider really spawns a subprocess."""
+        script = directory / "stub_cli.py"
+        script.write_text(STUB_CLI_SOURCE, encoding="utf-8")
+        bin_root = directory / "bin"
+        bin_root.mkdir()
+        if os.name == "nt":
+            launcher = bin_root / "stubcli.cmd"
+            launcher.write_text(f'@"{sys.executable}" "{script}" %*\n', encoding="ascii")
+        else:
+            launcher = bin_root / "stubcli"
+            launcher.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{script}" "$@"\n',
+                                encoding="ascii")
+            launcher.chmod(0o755)
+        return bin_root
+
+    def test_generic_cli_provider_drives_real_actions_through_a_subprocess(self):
+        """First decision really spawns a CLI; the rest fall back so the test stays fast."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bin_root = self._install_stub_cli(root)
+            received = root / "received"
+            backend = CliBackend(key="stub", label="Stub CLI", executables=("stubcli",),
+                                 template=("run", "{model}", "--format", "json"),
+                                 prompt_mode="stdin", default_model="stub-1")
+
+            class FirstCallRealCLI(GenericCLIProvider):
+                def __init__(self, **kwargs):
+                    super().__init__(**kwargs)
+                    self.fallback = BuiltinAIProvider()
+                    self.used = False
+
+                def request_action(self, visible_state, request):
+                    if not self.used:
+                        self.used = True
+                        return super().request_action(visible_state, request)
+                    return self.fallback.request_action(visible_state, request)
+
+            with patch.dict(os.environ,
+                            {"PATH": f"{bin_root}{os.pathsep}{os.environ['PATH']}"}), \
+                    patch.dict(CLI_BACKENDS, {"stub": backend}):
+                provider = FirstCallRealCLI(backend="stub", timeout=60, retries=0,
+                                            extra_args=[f"--received-dir={received}"])
+                state = create_game(7, "villager", seed=4)
+                engine = HumanGameEngine(provider)
+                for _ in range(1500):
+                    if state["phase"] == "game_over":
+                        break
+                    if state["pending"]["actor"] == state["human_seat"]:
+                        engine.submit_human(state, human_intent(state))
+                    else:
+                        engine.advance_ai(state)
+
+            self.assertIn(state["winner"], {"好人阵营", "狼人阵营"})
+            calls = sorted(received.glob("call_*.json"))
+            self.assertEqual(len(calls), 1)
+            payload = calls[0].read_text(encoding="utf-8")
+            self.assertIn('"visible_state"', payload)
+            self.assertIn('"player_impressions"', payload)
+            self.assertNotIn('"roles"', payload)
+
+
+class MirrorBoardTests(unittest.TestCase):
+    """镜隐迷踪板子的核心规则验证。"""
+
+    def _mirror_game(self, seed=1, human_seat=7):
+        return create_game(human_seat=human_seat, debug_role="random",
+                           seed=seed, board="mirror")
+
+    def _hidden_seat(self, state):
+        return int(next(k for k, v in state["roles"].items() if v == "hidden_wolf"))
+
+    def test_mirror_deck_composition(self):
+        from game.human_game import MIRROR_DECK
+        from collections import Counter
+        c = Counter(MIRROR_DECK)
+        self.assertEqual(len(MIRROR_DECK), 12)
+        self.assertEqual(c["werewolf"], 3)
+        self.assertEqual(c["hidden_wolf"], 1)
+        self.assertEqual(c["mirror_maiden"], 1)
+        self.assertEqual(c["guard"], 1)
+        self.assertEqual(c["witch"], 1)
+        self.assertEqual(c["hunter"], 1)
+        self.assertEqual(c["villager"], 4)
+
+    def test_create_mirror_game_sets_board(self):
+        state = self._mirror_game()
+        self.assertEqual(state["board"], "mirror")
+        self.assertEqual(state["rules"]["board"], "镜隐迷踪")
+        self.assertEqual(public_state_for_human(state)["board"], "mirror")
+        roles = list(state["roles"].values())
+        self.assertIn("hidden_wolf", roles)
+        self.assertIn("mirror_maiden", roles)
+        self.assertIn("hunter", roles)
+        self.assertNotIn("wolf_beauty", roles)
+        self.assertNotIn("seer", roles)
+        self.assertNotIn("knight", roles)
+
+    def test_hidden_wolf_not_told_small_wolf_identity(self):
+        state = self._mirror_game()
+        hidden = self._hidden_seat(state)
+        view = get_visible_state(state, hidden)
+        wolf_seen = [p["seat"] for p in view["players"] if p["role"] == "werewolf"]
+        self.assertEqual(wolf_seen, [])
+        self.assertEqual(view["private"]["wolf_teammates"], [])
+
+    def test_hidden_wolf_does_not_see_wolf_chat(self):
+        state = self._mirror_game()
+        hidden = self._hidden_seat(state)
+        # 塞一条狼聊进去
+        state["wolf_chat"].append({"day": 1, "speaker": 3, "text": "今晚刀2号"})
+        view = get_visible_state(state, hidden)
+        self.assertNotIn("wolf_chat", view["private"])
+        self.assertEqual(view["private"]["wolf_teammates"], [])
+        # 小狼仍能看到狼聊
+        small = int(next(k for k, v in state["roles"].items() if v == "werewolf"))
+        small_view = get_visible_state(state, small)
+        self.assertIn("wolf_chat", small_view["private"])
+
+    def test_dead_human_hidden_wolf_can_watch_wolf_chat(self):
+        state = self._mirror_game(human_seat=1)
+        hidden = self._hidden_seat(state)
+        state["human_seat"] = hidden
+        state["players"][str(hidden)]["alive"] = False
+        state["wolf_chat"].append({"day": 1, "speaker": 3, "text": "今晚刀2号"})
+        view = get_visible_state(state, hidden)
+        self.assertEqual(view["private"]["wolf_chat"][0]["speaker"], 3)
+        # 小狼本来就能看到狼聊；死亡真人的额外观战权限不会改变其他角色视角。
+        small = int(next(k for k, v in state["roles"].items() if v == "werewolf"))
+        ai_view = get_visible_state(state, small)
+        self.assertIn("wolf_chat", ai_view["private"])
+
+    def test_hidden_wolf_human_cannot_see_wolf_chat_actor_or_turn(self):
+        state = self._mirror_game(human_seat=1)
+        hidden = self._hidden_seat(state)
+        state["human_seat"] = hidden
+        _start_mirror_wolf_chat(state)
+        public = public_state_for_human(state)
+        self.assertEqual(public["pending"]["action"], "night_wait")
+        self.assertIsNone(public["pending"]["actor"])
+        self.assertNotIn("wolf_chat", public["private"])
+
+    def test_hidden_wolf_is_told_learned_identity_immediately(self):
+        state = self._mirror_game(human_seat=1)
+        hidden = self._hidden_seat(state)
+        state["human_seat"] = hidden
+        _start_hidden_wolf_learn(state)
+        target = next(seat for seat in state["pending"]["allowed_targets"]
+                      if state["roles"][str(seat)] == "witch")
+        HumanGameEngine(BuiltinAIProvider()).submit_human(
+            state, {"action": "hidden_learn", "target": target}
+        )
+        view = get_visible_state(state, hidden)
+        self.assertEqual(view["private"]["learned_role"], "witch")
+
+    def test_mirror_board_day_phases_still_advance(self):
+        """回归：mirror 板子的非夜间阶段（警长竞选等）必须正常推进，不能死锁。"""
+        state = self._mirror_game()
+        # 模拟警长竞选已收齐 12 份决定并公布
+        state["phase"] = "sheriff_campaign"
+        state["phase_data"] = {"queue": list(range(1, 13)), "index": 12, "action": "campaign",
+                               "fixed_allowed": [], "prompt": "请选择上警或不上警。",
+                               "candidates": [2, 3, 6], "campaign_decisions": {
+                                   str(i): (i in (2, 3, 6)) for i in range(1, 13)},
+                               "simultaneous": True, "published": False}
+        _queue_complete(state)
+        # 上警者 [2,3,6] → 应进入警上发言，而不是 pending=None 死锁
+        self.assertEqual(state["phase"], "sheriff_speech")
+        self.assertIsNotNone(state["pending"])
+        self.assertEqual(state["pending"]["action"], "campaign_speech")
+
+    def test_small_wolf_not_told_hidden_wolf_identity(self):
+        state = self._mirror_game()
+        small = int(next(k for k, v in state["roles"].items() if v == "werewolf"))
+        view = get_visible_state(state, small)
+        hidden_seen = [p for p in view["players"] if p["role"] == "hidden_wolf"]
+        self.assertEqual(hidden_seen, [])
+
+    def test_awakened_hidden_wolf_cannot_explode(self):
+        state = self._mirror_game(human_seat=1)
+        hidden = self._hidden_seat(state)
+        state["human_seat"] = hidden
+        state["day"] = 2
+        state["phase"] = "day_speech"
+        self.assertFalse(public_state_for_human(state)["can_wolf_explode"])
+
+    def test_mirror_small_wolf_can_explode(self):
+        state = self._mirror_game(human_seat=1)
+        small = int(next(k for k, v in state["roles"].items() if v == "werewolf"))
+        state["human_seat"] = small
+        state["day"] = 2
+        state["phase"] = "day_pk_speech"
+        self.assertTrue(public_state_for_human(state)["can_wolf_explode"])
+        HumanGameEngine(BuiltinAIProvider()).submit_human(state, {"action": "wolf_explode"})
+        self.assertEqual(state["players"][str(small)]["revealed_role"], "werewolf")
+        self.assertEqual(state["phase"], "night_hidden_learn")
+
+    def test_mirror_peek_shows_learned_role_for_hidden_wolf(self):
+        from game.human_game import HIDDEN_WOLF_LEARNABLE, _role
+        state = self._mirror_game()
+        hidden = self._hidden_seat(state)
+        for learned, expected in [("seer", "seer"), ("villager", "villager"),
+                                  ("werewolf", "werewolf"), ("guard", "guard")]:
+            state["abilities"]["hidden_wolf_learned"][str(hidden)] = learned
+            shown = HIDDEN_WOLF_LEARNABLE.get(learned, learned)
+            self.assertEqual(shown, expected)
+
+    def test_mirror_maiden_builtin_ai_reports_concrete_check_like_seer(self):
+        state = self._mirror_game(human_seat=1)
+        maiden = int(next(k for k, v in state["roles"].items() if v == "mirror_maiden"))
+        state["human_seat"] = maiden
+        state["abilities"]["mirror_peeks"] = {
+            str(maiden): [{"day": 1, "seat": 3, "shown_role": "guard"}]
+        }
+        view = get_visible_state(state, maiden)
+        provider = BuiltinAIProvider()
+        speech = provider.request_action(
+            view, {"action": "campaign_speech", "actor": maiden,
+                   "allowed_targets": [], "sequence": 1}
+        )
+        self.assertIn("魔镜少女", speech["text"])
+        self.assertIn("3号", speech["text"])
+        self.assertIn("守卫", speech["text"])
+        self.assertNotIn("是好人", speech["text"])
+        self.assertNotIn("是狼人", speech["text"])
+
+    def test_mirror_prompt_requires_exact_role_reporting(self):
+        prompt = action_prompt("campaign_speech")
+        self.assertIn("强化版预言家", prompt)
+        self.assertIn("真实具体身份", prompt)
+        self.assertIn("不是‘好人/狼人’二分", prompt)
+
+    def test_mirror_peek_shows_real_role_for_normal(self):
+        from game.human_game import _role
+        state = self._mirror_game()
+        hidden = self._hidden_seat(state)
+        for seat in range(1, 13):
+            if _role(state, seat) != "hidden_wolf":
+                self.assertEqual(_role(state, seat), _role(state, seat))
+
+    def test_double_blade_kills_two(self):
+        from game.human_game import _role
+        state = self._mirror_game()
+        hidden = self._hidden_seat(state)
+        state["abilities"]["hidden_wolf_learned"][str(hidden)] = "werewolf"
+        for seat in range(1, 13):
+            if _role(state, seat) == "werewolf":
+                state["players"][str(seat)]["alive"] = False
+        state["night"]["wolf_targets"] = [1, 2]
+        state["night"]["wolf_target"] = None
+        state["night"]["guard"] = None
+        state["night"]["saved"] = False
+        _resolve_night(state)
+        self.assertEqual(sorted(state["night"]["deaths"]), [1, 2])
+
+    def test_hunter_cannot_shoot_when_poisoned(self):
+        state = self._mirror_game(seed=8)
+        hunter = int(next(k for k, v in state["roles"].items() if v == "hunter"))
+        _kill(state, hunter, "被毒杀")
+        self.assertNotIn(hunter, state.get("_hunter_shots_pending", []))
+
+    def test_hunter_can_shoot_when_exiled(self):
+        state = self._mirror_game(seed=8)
+        hunter = int(next(k for k, v in state["roles"].items() if v == "hunter"))
+        _kill(state, hunter, "放逐")
+        self.assertIn(hunter, state.get("_hunter_shots_pending", []))
+
+    def test_hidden_wolf_who_learned_hunter_can_shoot_after_death(self):
+        state = self._mirror_game(seed=8)
+        hidden = self._hidden_seat(state)
+        state["abilities"]["hidden_wolf_learned"][str(hidden)] = "hunter"
+        _kill(state, hidden, "放逐")
+        self.assertIn(hidden, state.get("_hunter_shots_pending", []))
+        _after_deaths(state, "post_exile")
+        self.assertEqual(state["phase"], "hunter_shoot")
+        self.assertEqual(state["pending"]["actor"], hidden)
+        self.assertEqual(state["pending"]["action"], "hunter_shoot")
+
+    def test_mirror_win_condition_slaughter_gods(self):
+        state = self._mirror_game(seed=5)
+        for k, v in state["roles"].items():
+            if v in ("mirror_maiden", "guard", "witch", "hunter"):
+                state["players"][k]["alive"] = False
+        self.assertEqual(_winner(state), "狼人阵营")
 
 
 if __name__ == "__main__":

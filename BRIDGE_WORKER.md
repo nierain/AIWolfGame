@@ -5,7 +5,7 @@
 ## 一次性准备（已有服务可跳过）
 
 ```bat
-启动狼人杀-桥接.bat
+启动狼人杀.bat，然后在网页设置中选择“Codex 文件桥接”
 ```
 
 等价命令（工作目录 `D:\gibhub\GithubStar\AIWolfGame`）：
@@ -42,8 +42,10 @@ Worker 不许把 A 座位的推理、结论、立场带给 B 座位，更不许�
 - **方式 A：每个任务交给一个全新上下文的子 Agent 决策。** 拿到 task_id 后起一个干净的子 Agent，只给它一条指令：
   "用 `tools/bridge_worker.py show <id>` 读你自己的视角，想清楚后用 `reply` 写回；不许读存档、不许读别人的任务、不许问别人"。
   子 Agent 没有前文记忆，只能靠公开发言判断——这才是"看到彼此的想法"的正确形态（想法只以发言的形式存在）。
-- **方式 B：直接换 `--provider codex-cli`。** 每个行动一次独立调用，天然零共享上下文；
+- **方式 B：直接换 `--provider cli --cli codex`。** 每个行动一次独立调用，天然零共享上下文；
   而且骑士决斗在这个模式下是有效的（`human_game.py:958` 只跳过 `codex`，不跳过 `codex_cli`）。
+- **方式 B'：换 `--provider cli --cli <ollama|claude|gemini>`。** 同样是每个行动一次独立进程，
+  但用的是本机其他 CLI 模型；输出结构、提示词和合法性校验与 Codex CLI 完全一致。
 
 还要守住：
 
@@ -60,6 +62,6 @@ Worker 不许把 A 座位的推理、结论、立场带给 B 座位，更不许�
 
 ## 注意
 
-- 一个 Agent 包 11 个座位，处理任务时必然会看到每个座位自己的视角，一场下来会攒出全场底牌——真人接受这一点，只要别串用、别剧透。真要"连 Worker 都零记忆"，改用 `--provider codex-cli`（每次行动独立调用、互不共享上下文）。
+- 一个 Agent 包 11 个座位，处理任务时必然会看到每个座位自己的视角，一场下来会攒出全场底牌——真人接受这一点，只要别串用、别剧透。真要"连 Worker 都零记忆"，改用 `--provider cli --cli codex`（每次行动独立调用、互不共享上下文）。
 - 真人希望被称呼为 **rain**。
 - 本机坑：bash 缺 coreutils；PowerShell 工具沙箱报 Access Denied；`tasklist`/`netstat` 输出是 GBK。
