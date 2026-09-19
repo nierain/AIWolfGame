@@ -21,6 +21,7 @@ from game.ai_providers import (
     ProviderFailure,
     action_schema,
     action_prompt,
+    board_rules_prompt,
     load_api_profile,
     parse_action_payload,
     split_cli_args,
@@ -55,6 +56,8 @@ from game.human_game import (
     _start_withdraw,
     _start_mirror_wolf_chat,
     _start_hidden_wolf_learn,
+    _mirror_start_hidden_skill,
+    _start_night,
     _winner,
     create_game,
     get_visible_state,
@@ -86,7 +89,7 @@ request = payload["request"]
 action = request["action"]
 targets = list(request.get("allowed_targets", []))
 intent = {"action": action, "target": None, "text": None, "join": None,
-          "withdraw": None, "use": None, "direction": None, "player_impressions": None}
+          "withdraw": None, "use": None, "choice": None, "direction": None, "player_impressions": None}
 if action == "postgame_speech":
     intent["text"] = "我复盘一下这局的判断。"
     intent["player_impressions"] = [{"seat": seat, "impression": "关键轮次表现稳定。"}
@@ -102,6 +105,8 @@ elif action == "withdraw":
     intent["withdraw"] = False
 elif action == "witch_save":
     intent["use"] = False
+elif action == "witch_action":
+    intent["choice"] = "none"
 elif action == "sheriff_order":
     intent["direction"] = "forward"
 elif action == "knight_decide":
@@ -151,6 +156,8 @@ def human_intent(state):
         return {"action": action, "withdraw": False}
     if action == "witch_save":
         return {"action": action, "use": False}
+    if action == "witch_action":
+        return {"action": action, "choice": "none", "target": None}
     if action == "witch_poison":
         return {"action": action, "target": None}
     if action == "sheriff_order":
@@ -224,7 +231,7 @@ def stub_intent_for(request):
     action = request["action"]
     targets = list(request.get("allowed_targets", []))
     intent = {"action": action, "target": None, "text": None, "join": None,
-              "withdraw": None, "use": None, "direction": None, "player_impressions": None}
+              "withdraw": None, "use": None, "choice": None, "direction": None, "player_impressions": None}
     if action == "postgame_speech":
         intent["text"] = "我复盘一下这局的判断。"
         intent["player_impressions"] = [{"seat": seat, "impression": "关键轮次表现稳定。"}
@@ -242,6 +249,8 @@ def stub_intent_for(request):
         intent["withdraw"] = False
     elif action == "witch_save":
         intent["use"] = False
+    elif action == "witch_action":
+        intent["choice"] = "none"
     elif action == "sheriff_order":
         intent["direction"] = "forward"
     elif action == "knight_decide":
@@ -344,7 +353,8 @@ class HumanGameTests(unittest.TestCase):
 
         self.assertEqual(restored["phase"], "post_game_speech")
         self.assertEqual(restored["pending"]["action"], "postgame_speech")
-        self.assertEqual(restored["phase_data"]["queue"], list(range(1, 13)))
+        expected_order = [4] + [seat for seat in range(1, 13) if seat != 4]
+        self.assertEqual(restored["phase_data"]["queue"], expected_order)
         self.assertEqual(len([event for event in restored["history"]
                               if event.get("phase") == "post_game_speech"]), 1)
         self.assertEqual(len([event for event in restored_again["history"]
@@ -536,7 +546,7 @@ class HumanGameTests(unittest.TestCase):
     def test_every_night_role_waits_for_human(self):
         expected = {
             "werewolf": "wolf_chat", "wolf_beauty": "wolf_chat", "seer": "divine",
-            "witch": "witch_save", "guard": "guard",
+            "witch": "witch_action", "guard": "guard",
         }
         for role, action in expected.items():
             with self.subTest(role=role):
@@ -615,12 +625,56 @@ class HumanGameTests(unittest.TestCase):
         self.assertEqual(state["abilities"]["guard_last"], target)
 
         state = create_game(2, "witch", seed=31)
-        drive(state, stop=lambda s: s["pending"]["actor"] == 2 and s["pending"]["action"] == "witch_save")
-        engine.submit_human(state, {"action": "witch_save", "use": False})
-        self.assertEqual(state["pending"]["action"], "witch_poison")
+        drive(state, stop=lambda s: s["pending"]["actor"] == 2 and s["pending"]["action"] == "witch_action")
         target = state["pending"]["allowed_targets"][0]
-        engine.submit_human(state, {"action": "witch_poison", "target": target})
+        engine.submit_human(state, {"action": "witch_action", "choice": "poison", "target": target})
         self.assertFalse(state["abilities"]["witch_poison"])
+        self.assertTrue(state["abilities"]["witch_medicine"])
+        self.assertTrue(state["night"]["witch_action_used"])
+
+    def test_witch_uses_at_most_one_bottle_and_legacy_fields_cannot_double_kill(self):
+        state = create_game(2, "witch", seed=31)
+        drive(state, stop=lambda s: s["pending"]["actor"] == 2
+              and s["pending"]["action"] == "witch_action")
+        victim = state["night"]["wolf_target"]
+        self.assertIsNotNone(victim)
+        engine = HumanGameEngine(BuiltinAIProvider())
+        engine.submit_human(state, {"action": "witch_action", "choice": "save", "target": victim})
+        self.assertEqual(state["night"].get("witch_choice"), "save")
+        self.assertTrue(state["night"]["witch_action_used"])
+        self.assertTrue(state["abilities"]["witch_poison"])
+        self.assertIsNone(state["night"].get("poison"))
+        self.assertNotIn(state["phase"], {"night_witch_save", "night_witch_poison"})
+
+        # A stale/hand-edited legacy night must still resolve only one bottle.
+        other = next(seat for seat in range(1, 13) if seat not in {2, victim})
+        state = create_game(1, "villager", seed=23)
+        state["day"] = 1
+        state["phase"] = "night_witch_action"
+        state["night"] = {
+            "wolf_votes": {}, "wolf_target": victim, "guard": None,
+            "saved": True, "poison": other, "deaths": [],
+            "witch_action_used": True, "witch_choice": "save",
+            "wolf_targets": [], "hidden_poison": None, "hidden_guard": None,
+        }
+        _resolve_night(state)
+        self.assertTrue(state["players"][str(victim)]["alive"])
+        self.assertTrue(state["players"][str(other)]["alive"])
+
+        # With a mirror-board double kill, one antidote protects exactly the
+        # selected victim; it must not make both wolf targets survive.
+        state = create_game(1, "villager", seed=23, board="mirror")
+        state["day"] = 1
+        state["phase"] = "night_witch_action"
+        state["night"] = {
+            "wolf_votes": {}, "wolf_target": 2, "wolf_targets": [3],
+            "guard": None, "saved": True, "saved_target": 3,
+            "poison": None, "deaths": [], "witch_action_used": True,
+            "witch_choice": "save", "hidden_poison": None, "hidden_guard": None,
+        }
+        _resolve_night(state)
+        self.assertFalse(state["players"]["2"]["alive"])
+        self.assertTrue(state["players"]["3"]["alive"])
 
     def test_wolf_self_kill_rule(self):
         engine = HumanGameEngine(BuiltinAIProvider())
@@ -774,6 +828,21 @@ class HumanGameTests(unittest.TestCase):
         report_index = next(i for i, event in enumerate(state["history"])
                             if "昨夜死亡玩家" in event["text"])
         self.assertLess(election_index, report_index)
+
+    def test_guard_and_witch_save_same_target_triggers_nai_chuan(self):
+        state = create_game(1, "villager", seed=23)
+        victim = 2
+        state["day"] = 1
+        state["phase"] = "night_witch_action"
+        state["night"] = {
+            "wolf_votes": {}, "wolf_target": victim, "guard": victim,
+            "saved": True, "poison": None, "deaths": [],
+            "witch_action_used": True, "wolf_targets": [],
+            "hidden_poison": None, "hidden_guard": None,
+        }
+        _resolve_night(state)
+        self.assertFalse(state["players"][str(victim)]["alive"])
+        self.assertTrue(any("触发奶穿" in event["text"] for event in state["history"]))
 
     def test_only_original_sheriff_non_candidates_can_vote(self):
         state = create_game(12, "villager", seed=12)
@@ -961,7 +1030,7 @@ class HumanGameTests(unittest.TestCase):
         self.assertIn(state["winner"], {"好人阵营", "狼人阵营"})
 
     def test_every_seat_speaks_in_postgame_debrief_before_game_over(self):
-        state = create_game(1, "villager", seed=31)
+        state = create_game(7, "villager", seed=31)
         for seat in range(1, 13):
             if state["roles"][str(seat)] in WOLF_ROLES:
                 state["players"][str(seat)]["alive"] = False
@@ -970,8 +1039,9 @@ class HumanGameTests(unittest.TestCase):
 
         self.assertEqual(state["winner"], "好人阵营")
         self.assertEqual(state["phase"], "post_game_speech")
-        self.assertEqual(state["phase_data"]["queue"], list(range(1, 13)))
-        self.assertEqual(state["pending"]["actor"], 1)
+        expected_order = [7] + [seat for seat in range(1, 13) if seat != 7]
+        self.assertEqual(state["phase_data"]["queue"], expected_order)
+        self.assertEqual(state["pending"]["actor"], 7)
         revealed = get_visible_state(state, 2)
         self.assertTrue(all(player["role"] for player in revealed["players"]))
 
@@ -993,7 +1063,7 @@ class HumanGameTests(unittest.TestCase):
         debriefs = [event for event in state["history"]
                     if event["kind"] == "speech" and event["phase"] == "post_game_speech"]
         self.assertEqual(state["phase"], "game_over")
-        self.assertEqual([event["speaker"] for event in debriefs], list(range(1, 13)))
+        self.assertEqual([event["speaker"] for event in debriefs], expected_order)
         self.assertEqual(len(state["mvp_votes"]), 12)
         self.assertEqual(sum(state["mvp_result"]["counts"].values()), 12)
         self.assertTrue(state["mvp_result"]["winners"])
@@ -1083,31 +1153,47 @@ class HumanGameTests(unittest.TestCase):
         view = get_visible_state(state, actor)
         request = state["pending"]
 
-        def fake_run(command, **kwargs):
-            output = Path(command[command.index("-o") + 1])
-            output.write_text(json.dumps({
-                "action": request["action"], "target": None,
-                "text": "今晚先观察警上位置。", "join": None,
-                "withdraw": None, "use": None, "direction": None,
-            }, ensure_ascii=False), encoding="utf-8")
-            return type("Completed", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+        class FakeProcess:
+            def __init__(self, command, **kwargs):
+                self.command = command
+                self.kwargs = kwargs
+                self.returncode = 0
+                self.stdin = self.stdout = self.stderr = None
+
+            def communicate(self, payload, timeout=None):
+                Path(self.command[self.command.index("-o") + 1]).write_text(json.dumps({
+                    "action": request["action"], "target": None,
+                    "text": "今晚先观察警上位置。", "join": None,
+                    "withdraw": None, "use": None, "direction": None,
+                }, ensure_ascii=False), encoding="utf-8")
+                self.sent = payload
+                return "", ""
+
+        started = []
+
+        def fake_popen(command, **kwargs):
+            process = FakeProcess(command, **kwargs)
+            started.append(process)
+            return process
 
         with patch("game.ai_providers.shutil.which", return_value="codex.cmd"), \
-                patch("game.ai_providers.subprocess.run", side_effect=fake_run) as run:
+                patch("game.ai_providers._desktop_codex_candidates", return_value=[]), \
+                patch("game.ai_providers.subprocess.Popen", side_effect=fake_popen):
             provider = CodexCLIProvider()
             intent = provider.request_action(view, request)
 
         self.assertEqual(intent["action"], request["action"])
-        sent = run.call_args.kwargs["input"]
-        command = run.call_args.args[0]
+        started_once = started[0]
+        sent = started_once.sent
+        command = started_once.command
         self.assertIn("--model", command)
         self.assertNotEqual(command[command.index("--model") + 1], "None")
         self.assertNotIn('"roles"', sent)
         self.assertIn('"visible_state"', sent)
-        self.assertIn("--ephemeral", run.call_args.args[0])
-        self.assertIn("--ignore-user-config", run.call_args.args[0])
+        self.assertIn("--ephemeral", command)
+        self.assertIn("--ignore-user-config", command)
         self.assertEqual(
-            run.call_args.kwargs["env"]["CODEX_HOME"],
+            started_once.kwargs["env"]["CODEX_HOME"],
             str(Path.home() / ".codex"),
         )
 
@@ -1274,6 +1360,72 @@ class HumanGameTests(unittest.TestCase):
         self.assertIn("--format", other)
 
         self.assertIn("没有输出任何错误信息", summarize_cli_error("", "Ollama"))
+
+    def test_cli_timeout_aborts_the_whole_process_tree(self):
+        """回归：CLI 超时必须真的返回，并且把包装器与孙子进程一起清掉。
+
+        Windows 上 ``subprocess.run(timeout=...)`` 超时后只杀直接子进程，紧接着又调一次
+        ``communicate()`` 去读干净管道；孙子进程（npm ``codex.cmd`` → node → codex.exe）
+        仍握着继承来的管道句柄时，那次 drain 会永久阻塞 —— 超时形同虚设，面板连同请求锁
+        一起卡死（2026-09-19 实战：整局冻结十几分钟）。这里用一个自己再 fork 一层的桩
+        复现同样的进程结构。
+        """
+        import subprocess
+        import time
+        from game.ai_providers import _run_cli_with_timeout
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            heartbeat = root / "heartbeat.txt"
+            (root / "child.py").write_text(
+                "import pathlib, sys, time\n"
+                "beat = pathlib.Path(sys.argv[1])\n"
+                "while True:\n"
+                "    beat.write_text('alive', encoding='utf-8')\n"
+                "    time.sleep(0.2)\n",
+                encoding="utf-8",
+            )
+            (root / "parent.py").write_text(
+                "import pathlib, subprocess, sys, time\n"
+                "root = pathlib.Path(sys.argv[1])\n"
+                "child = subprocess.Popen(\n"
+                "    [sys.executable, str(root / 'child.py'), str(root / 'heartbeat.txt')],\n"
+                "    stdout=sys.stdout, stderr=sys.stderr)\n"
+                "(root / 'child.pid').write_text(str(child.pid), encoding='utf-8')\n"
+                "time.sleep(120)\n",
+                encoding="utf-8",
+            )
+            observed = {}
+
+            def call():
+                try:
+                    _run_cli_with_timeout([sys.executable, str(root / "parent.py"), str(root)],
+                                          "payload", 2, os.environ.copy(), 0)
+                    observed["outcome"] = "returned"
+                except BaseException as exc:  # noqa: BLE001 - 断言具体类型
+                    observed["outcome"] = exc
+
+            thread = threading.Thread(target=call, daemon=True)
+            thread.start()
+            thread.join(timeout=60)
+            still_running = thread.is_alive()
+            beat_before = heartbeat.stat().st_mtime_ns if heartbeat.exists() else None
+            time.sleep(1.5)  # 心跳间隔 0.2 秒，1.5 秒足够判断它是否还活着
+            beat_after = heartbeat.stat().st_mtime_ns if heartbeat.exists() else None
+            pid_file = root / "child.pid"
+            if pid_file.exists() and pid_file.read_text(encoding="utf-8").strip():
+                child_pid = pid_file.read_text(encoding="utf-8").strip()
+                if os.name == "nt":
+                    subprocess.run(["taskkill", "/F", "/T", "/PID", child_pid],
+                                   capture_output=True, check=False)
+                else:
+                    with contextlib.suppress(ProcessLookupError, PermissionError):
+                        os.kill(int(child_pid), 9)
+
+        self.assertFalse(still_running, "超时调用没有返回：管道被孙子进程占住，进程树没杀干净")
+        self.assertIsInstance(observed.get("outcome"), subprocess.TimeoutExpired)
+        self.assertIsNotNone(beat_before, "桩进程没有起来，本用例没有验证到东西")
+        self.assertEqual(beat_before, beat_after, "孙子进程仍然活着，没有跟着包装器一起被清掉")
 
     def test_codex_initialization_access_denied_has_restart_guidance(self):
         for detail in (
@@ -1636,6 +1788,75 @@ class MirrorBoardTests(unittest.TestCase):
         )
         view = get_visible_state(state, hidden)
         self.assertEqual(view["private"]["learned_role"], "witch")
+        self.assertEqual(view["private"]["learned_target"], target)
+
+    def test_hidden_wolf_learns_only_on_the_first_night(self):
+        """回归：学过之后终身固定，第 2 夜起不能再问学习。
+
+        ``hidden_wolf_learned`` 的键是字符串座位号，早期代码用整数去查，
+        导致"已学过"判断永远为假，每个夜晚都会重复询问。
+        """
+        from game.human_game import _role
+        state = self._mirror_game(human_seat=1)
+        hidden = self._hidden_seat(state)
+        state["human_seat"] = hidden
+        _start_hidden_wolf_learn(state)
+        self.assertEqual(state["phase"], "night_hidden_learn")
+        self.assertEqual(state["pending"]["actor"], hidden)
+        target = state["pending"]["allowed_targets"][0]
+        HumanGameEngine(BuiltinAIProvider()).submit_human(
+            state, {"action": "hidden_learn", "target": target})
+        self.assertEqual(state["abilities"]["hidden_wolf_learned"][str(hidden)],
+                         _role(state, target))
+
+        # 第 2 夜：仍然复用同一个夜晚链，但不再询问学习
+        state["phase"] = "day_speech"
+        state["day"] = 1
+        _start_night(state)
+        self.assertNotEqual(state["phase"], "night_hidden_learn")
+        self.assertEqual(state["pending"]["action"], "wolf_chat")
+
+    def test_hidden_wolf_inherits_mirror_maiden_check_from_the_second_night(self):
+        """学到魔镜少女后，第 2 夜起可以具体身份查验，结果只有自己可见。"""
+        from game.human_game import _role
+        state = self._mirror_game(human_seat=1)
+        hidden = self._hidden_seat(state)
+        state["human_seat"] = hidden
+        maiden = next(seat for seat in range(1, 13) if _role(state, seat) == "mirror_maiden")
+        state["abilities"]["hidden_wolf_learned"][str(hidden)] = "mirror_maiden"
+        state["abilities"]["hidden_wolf_learn_target"][str(hidden)] = maiden
+
+        # 第 1 夜（day == 0）刚学到的技能本夜不可用
+        state["day"] = 0
+        _mirror_start_hidden_skill(state)
+        self.assertNotEqual(state["phase"], "night_hidden_skill")
+
+        state["day"] = 1
+        _mirror_start_hidden_skill(state)
+        self.assertEqual(state["phase"], "night_hidden_skill")
+        self.assertEqual(state["pending"]["actor"], hidden)
+        self.assertEqual(state["pending"]["action"], "hidden_skill")
+        self.assertEqual(state["phase_data"]["skill"], "peek")
+        self.assertIn("魔镜少女", state["pending"]["prompt"])
+        self.assertNotIn(hidden, state["pending"]["allowed_targets"])
+
+        target = next(seat for seat in state["pending"]["allowed_targets"]
+                      if _role(state, seat) == "guard")
+        HumanGameEngine(BuiltinAIProvider()).submit_human(
+            state, {"action": "hidden_skill", "target": target})
+        check = state["abilities"]["hidden_wolf_checks"][str(hidden)][0]
+        self.assertEqual(check["seat"], target)
+        self.assertEqual(check["shown_role"], "guard")
+        # 查验结果只进隐狼自己的私有视角
+        self.assertEqual(get_visible_state(state, hidden)["private"]["hidden_checks"], [check])
+        self.assertNotIn("hidden_checks",
+                         get_visible_state(state, target)["private"])
+
+    def test_full_offline_mirror_game_reaches_a_winner(self):
+        """回归：镜隐迷踪的夜间链（含隐狼继承技能）必须能自己走到终局，不能死锁。"""
+        state = create_game(7, "random", seed=4, board="mirror")
+        drive(state, limit=4000)
+        self.assertIn(state["winner"], {"好人阵营", "狼人阵营"})
 
     def test_mirror_board_day_phases_still_advance(self):
         """回归：mirror 板子的非夜间阶段（警长竞选等）必须正常推进，不能死锁。"""
@@ -1672,12 +1893,14 @@ class MirrorBoardTests(unittest.TestCase):
         state = self._mirror_game(human_seat=1)
         small = int(next(k for k, v in state["roles"].items() if v == "werewolf"))
         state["human_seat"] = small
+        # 模拟第 1 夜已经学过：自爆进入黑夜不应再回头询问隐狼学习
+        state["abilities"]["hidden_wolf_learned"][str(self._hidden_seat(state))] = "villager"
         state["day"] = 2
         state["phase"] = "day_pk_speech"
         self.assertTrue(public_state_for_human(state)["can_wolf_explode"])
         HumanGameEngine(BuiltinAIProvider()).submit_human(state, {"action": "wolf_explode"})
         self.assertEqual(state["players"][str(small)]["revealed_role"], "werewolf")
-        self.assertEqual(state["phase"], "night_hidden_learn")
+        self.assertEqual(state["phase"], "night_wolf_chat")
 
     def test_mirror_peek_shows_learned_role_for_hidden_wolf(self):
         from game.human_game import HIDDEN_WOLF_LEARNABLE, _role
@@ -1705,14 +1928,21 @@ class MirrorBoardTests(unittest.TestCase):
         self.assertIn("魔镜少女", speech["text"])
         self.assertIn("3号", speech["text"])
         self.assertIn("守卫", speech["text"])
+        self.assertNotIn("预言家", speech["text"])
         self.assertNotIn("是好人", speech["text"])
         self.assertNotIn("是狼人", speech["text"])
 
     def test_mirror_prompt_requires_exact_role_reporting(self):
         prompt = action_prompt("campaign_speech")
-        self.assertIn("强化版预言家", prompt)
-        self.assertIn("真实具体身份", prompt)
-        self.assertIn("不是‘好人/狼人’二分", prompt)
+        self.assertIn("包括真人玩家的发言", prompt)
+        self.assertIn("不能把真人发言当成背景噪音", prompt)
+        mirror = get_visible_state(self._mirror_game(), 1)
+        board_prompt = board_rules_prompt(mirror)
+        self.assertIn("本板没有预言家", board_prompt)
+        self.assertIn("独立的具体身份查验信息位", board_prompt)
+        self.assertIn("不能把魔镜少女称作预言家", board_prompt)
+        self.assertIn("真实具体身份", board_prompt)
+        self.assertIn("不是‘好人/狼人’二分", board_prompt)
 
     def test_mirror_peek_shows_real_role_for_normal(self):
         from game.human_game import _role

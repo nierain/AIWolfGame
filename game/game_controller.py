@@ -587,10 +587,21 @@ class GameController:
         # 处理夜晚死亡
         night_deaths = []
         
-        # 处理狼人杀人
-        if victim_id and not saved_by_witch:
-            # 检查是否被守卫守护
-            if guarded_target == victim_id:
+        # 处理狼人杀人。守卫与解药同时命中同一目标时触发“奶穿”，目标仍然出局。
+        same_guard_same_target = self.config.get("rules", {}).get("same_guard_same_target", True)
+        if victim_id:
+            if same_guard_same_target and saved_by_witch and guarded_target == victim_id:
+                print(f"\n{self.players[victim_id].name} 同守同救，触发奶穿，仍然出局")
+                self.game_state["history"].append({
+                    "round": self.current_round,
+                    "phase": "night",
+                    "event": "guard_save_conflict_kill",
+                    "victim": victim_id,
+                })
+                night_deaths.append((victim_id, "同守同救奶穿"))
+            elif saved_by_witch:
+                pass
+            elif guarded_target == victim_id:
                 print(f"\n{self.players[victim_id].name} 被守卫守护，逃过一劫")
                 self.game_state["history"].append({
                     "round": self.current_round,
@@ -605,7 +616,6 @@ class GameController:
         # 处理女巫毒人
         if poisoned_by_witch:
             # 检查是否被守卫守护（同守同救规则）
-            same_guard_same_target = self.config.get("rules", {}).get("same_guard_same_target", False)
             if same_guard_same_target and guarded_target == poisoned_by_witch:
                 print(f"\n{self.players[poisoned_by_witch].name} 被守卫守护，毒药无效")
                 self.game_state["history"].append({

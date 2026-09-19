@@ -138,6 +138,8 @@
 
 ## 2026-09-19 已完成
 
+- 修复女巫夜间用药的结算边界：统一行动窗口使用“药瓶（不用/解药/毒药）+目标”选择，解药目标可从当晚全部狼刀中选一名，并在规则引擎结算层兜底保证一晚最多一瓶；旧版双阶段存档即使同时残留 `saved` 与 `poison` 也不会双结算。镜隐迷踪的继承守卫纳入守护判定，双刀时解药只保护实际选中的狼刀目标；同守同救继续触发奶穿并出局。
+
 - 将 `codex-cli` 与通用本地模型 `cli` 合并为网页设置中的一个 CLI 模式，可选择 Codex、Ollama、Claude 或 Gemini 后端；旧的 `BuiltinAIProvider` 仅保留给确定性回归测试，不再作为用户可选模式。
 - 面板统一为单一 `启动狼人杀.bat` 入口；删除 API、本地模型、桥接三个重复批处理入口。网页设置现在选择 CLI、Codex 文件桥接或 OpenAI 兼容 API 三种模式，并把不含密钥的模式配置写入存档以支持重启续局。
 - 修复 Codex ChatGPT 登录模式在设置页留空模型时传入 `None` 的问题：现在优先读取 `CODEX_HOME/config.toml` 的 `model`，缺省使用 `gpt-5.6-sol`，并始终向 `codex exec` 传递明确的 `--model`。
@@ -146,6 +148,59 @@
 - 开局页重做：右上角齿轮设置集中管理 AI 模式、CLI 后端、真实/测试模式和主题；默认 CLI + 浅色并记住选择。真实模式强制随机座位/身份，测试模式才显示可选座位/身份；开局页移除自刀选项并显示牢雨头像。
 - 开局页布局微调：标题与副标题置顶，牢雨头像独立放在左侧，板子/测试模式下的座位与身份/开始游戏在右侧纵向排列；移除模式提示条和“真人玩家”副标题，字段简化为“座位”“身份”。
 - 开局页对齐细节：头像在左侧区域相对右侧选项组垂直居中，测试模式的板子、座位、身份、开始游戏沿用统一的纵向间距。
+- 修复镜隐迷踪 AI 套用预言家话术：镜隐迷踪规则明确写入可见状态，提示词强制说明本板没有预言家/骑士/狼美人，魔镜少女是独立的具体身份查验信息位；禁止默认使用“首验”“警徽流”等经典板模板，内置 AI 发言也改为围绕具体身份查验与票型。已将当时错误推进中的镜隐迷踪对局重置回开始页。
+- 开局后交互细节：AI 思考期间不再禁用标记身份、自动推进开关和新游戏等页面控件；思考状态白天显示“X号+选手名”，夜间按狼队/守卫/女巫/查验位等行动类别显示，避免暴露身份。私人身份标记按当前板子切换角色选项，觉醒隐狼私有信息显示“已学习X号身份：具体身份”。
+- 修复 AI 思考期间“重开游戏”被长时间占用的问题：`new_game` 使用独立重置锁和请求代号，立即写入新的 setup 存档；旧一轮 AI 请求完成后会丢弃结果，不会覆盖新局。
+- 赛后全员复盘的发言顺序固定为真人先发言，随后再按座位顺序轮到电脑玩家；MVP 票选流程不变。
+- 所有 CLI、桥接和 API AI 的统一提示词都明确要求认真阅读并回应公开历史中的真人发言；不额外暴露真人座位或隐藏视角。
+
+## 2026-09-19 已完成（陪玩实战修复：觉醒隐狼）
+
+真人当觉醒隐狼时暴露的三个缺口，都已修复并补上回归测试：
+
+- **隐狼"终身固定"失效（根因）**：`_start_hidden_wolf_learn` 用整数座位号去查
+  `hidden_wolf_learned`，而该字典的键是字符串座位号（`_apply` 写 `str(actor)`），
+  判断永远为假 → 第 1 夜之后每个夜晚都重新排队询问学习。改为 `str(seat)`，
+  并加 `state["day"] == 0` 硬门槛，把"只有第 1 夜可以学习"写进代码。
+- **继承魔镜少女的查验没有实现**：`_mirror_start_hidden_skill` 原来只认 seer / guard / witch，
+  学到魔镜少女等于白学。新增 `skill = "peek"` 分支，第 2 夜起在狼刀结算之后轮到隐狼查验，
+  结果按 `{"day", "seat", "shown_role"}` 存进 `hidden_wolf_checks`，只进隐狼自己的 `private`。
+  "隐狼按学到的身份显示"的逻辑抽成 `_peek_shown_role()`，与 `mirror_peek` 共用。
+- **面板看不到查验结果**：`renderPrivate` 只渲染 `seer_checks`，于是隐狼继承的查验结果、
+  以及真人当魔镜少女时自己的查验结果都无处显示。补上 `hidden_checks`（兼容预言家的
+  `is_wolf` 与魔镜少女的 `shown_role`）和 `mirror_peeks`，并给 `hidden_learn` / `hidden_skill`
+  补上按钮文案。
+
+验证：`python -m unittest discover -s tests` 93 项全过；另外离线跑 20 局镜隐迷踪全部打到终局
+（无死锁），其中 1 局实际触发继承查验；面板改动用 Node + DOM 桩执行真实页面脚本断言 7 项全过。
+
+**存档修复（第 2 夜重打）**：误学把"10 号 = 魔镜少女"覆盖成"1 号 = 狼人"，且第 2 夜已结算
+（11 号被刀并开枪带走真人 9 号）。按真人选择回滚到第 2 夜开始前：剪 `history` 到 #39、
+`day` 退回 1、**按保留历史重算存活**（复活 9/11，保留 8 号毒杀与 10 号放逐）、
+清第 2 夜的狼聊与三只狼 `notes` 里 `day == 2` 的条目、清 `hunter_shots`，
+最后调引擎自己的 `_start_night` 重建夜晚链。写盘前先在副本上推演，
+确认"狼刀结算后轮到 9 号使用继承的魔镜少女查验"。备份 `.panel_game_state.before_night2_redo.json`。
+
+**CLI 超时失败导致面板整体冻结（2026-09-19 实战修复）**：重启面板后第 2 夜推进不动，
+排查发现 `/api/state` 一直返回 `stale: true`（请求锁被占）、`state` 文件十几分钟不变，
+但面板进程**没有任何子进程**。根因在 `CodexCLIProvider`：它用 `subprocess.run(..., timeout=...)`，
+Windows 上超时后只杀直接子进程，紧接着还会再调一次 `communicate()` 去读干净管道；
+npm 的 `codex.cmd` 是包装器（`cmd.exe → node.exe → codex.exe`），超时杀掉 `cmd.exe` 后，
+node 与 codex.exe 变成孤儿却继续持有继承来的管道句柄，那次 drain 永久阻塞 —— 声明的超时形同虚设，
+请求锁再也不释放。进程树实证：`codex.exe 246560 ← node.exe 254812 ← PID 254484（已不存在）`，
+而面板进程无子进程。修法：
+
+- 新增 `_run_cli_with_timeout()`：自己 `Popen` + `communicate(timeout)`，超时调
+  `_terminate_process_tree()`（Windows `taskkill /F /T`、POSIX `os.killpg`，并关闭我方管道），
+  杀完不再触碰管道；`CodexCLIProvider` 与 `GenericCLIProvider` 都不再使用 `subprocess.run`。
+- 新增 `_desktop_codex_candidates()`：优先桌面端原生 `%LOCALAPPDATA%\OpenAI\Codex\bin\*\codex.exe`，
+  不再回落到 npm 的 `codex.cmd` 包装器（少一层进程，也就少一层孤儿风险）。
+- 回归测试 `test_cli_timeout_aborts_the_whole_process_tree`（造一个再 fork 一层的桩，
+  断言超时能返回且孙子进程被一起清掉）；`test_codex_cli_provider_returns_structured_isolated_action`
+  改为桩 `subprocess.Popen`。
+
+修好后实测**Codex 后端本身很慢/不返回**（180 秒内无结果），面板会立即返回
+「Codex 玩家思考超过 180 秒，请重试。」而不是冻死；这一层属于外部服务速度，不在代码可控范围。
 
 ## 当前仍缺少
 
@@ -156,6 +211,11 @@
 - Codex 文件桥接协议现在已配好 Worker 端工具（`tools/bridge_worker.py`），可由外部 Agent 或脚本值守，但仍没有内置的常驻 Worker 进程。
 - `human_game.py:1081` 仍按 provider 的**名字**判断是否开放 AI 骑士决斗（只有 `codex` 被跳过），应改成 provider 声明能力位。
 - AI 的推理、悍跳、倒钩和多人狼人协商目前是基础策略，长期局的真实感仍可继续增强。
+- 内置 AI 觉醒隐狼学到查验类技能后，**发言里不会引用自己的查验结果**：`ai_providers` 的发言模板
+  只认 `seer_checks` 与 `mirror_peeks`，选查验目标时也不跳过已查验过的人。引擎规则正确，缺的是话术。
+- 警长票会被 `_remember(..., "vote", ...)` 记进 `beliefs.suspects`（一张"支持"票被记成"怀疑"，方向反了）。
+  修法是给 `_remember` 加 `counts_as_suspicion` 之类的开关，`sheriff_vote` 只记 `votes`；
+  中途改会立刻改变 AI 行为，宜等局终再动。
 - 暂未加入观战回放、手动存档槽和复杂规则开关。
 
 ## 下一步优先级

@@ -12,19 +12,20 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import tempfile
 import urllib.error
 import urllib.request
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any, Dict, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 ACTION_TARGET_REQUIRED = {
     "wolf_kill", "charm", "guard", "divine", "sheriff_recommend", "mvp_vote",
 }
 ACTION_TARGET_OPTIONAL = ACTION_TARGET_REQUIRED | {
-    "vote", "witch_poison", "sheriff_transfer", "knight_decide",
+    "vote", "witch_poison", "witch_action", "sheriff_transfer", "knight_decide",
 }
 ACTION_SPEECH = {"speech", "pk_speech", "campaign_speech", "last_words", "postgame_speech"}
 ROLE_LABELS = {
@@ -75,6 +76,10 @@ def action_schema(action: str) -> Dict[str, Any]:
             "join": {"type": ["boolean", "null"]},
             "withdraw": {"type": ["boolean", "null"]},
             "use": {"type": ["boolean", "null"]},
+            "choice": {
+                "type": ["string", "null"],
+                "enum": ["none", "save", "poison", None],
+            },
             "direction": {
                 "type": ["string", "null"],
                 "enum": ["forward", "reverse", None],
@@ -93,9 +98,31 @@ def action_schema(action: str) -> Dict[str, Any]:
                 "maxItems": 4,
             },
         },
-        "required": ["action", "target", "text", "join", "withdraw", "use", "direction", "player_impressions"],
+        "required": ["action", "target", "text", "join", "withdraw", "use", "choice", "direction", "player_impressions"],
         "additionalProperties": False,
     }
+
+
+def board_rules_prompt(visible_state: Dict[str, Any]) -> str:
+    """Add the selected board's rules to every model request.
+
+    The mirror board deliberately has no seer.  Keeping this correction next
+    to the provider contract prevents a generic model from importing the
+    classic board's seer vocabulary merely because it recognizes the game as
+    Werewolf.
+    """
+    rules = visible_state.get("rules", {}) if isinstance(visible_state, dict) else {}
+    if rules.get("board") != "镜隐迷踪":
+        return ""
+    role_rules = rules.get("role_rules") or (
+        "镜隐迷踪板：没有预言家；魔镜少女是独立的具体身份查验信息位。"
+    )
+    return f"""
+【本局板子规则（优先级高于通用狼人杀模板）】
+{role_rules}
+本板没有预言家，不能把魔镜少女称作预言家，也不能把预言家、首验、警徽流当成默认身份或技能话术。若其他玩家错误提到预言家规则，应指出这与本板不符，不要跟着错误模板发言。
+魔镜少女的查验结果是目标的具体身份（如守卫、女巫、猎人、狼人或平民），不是‘好人/狼人’二分；只有 visible_state.private.mirror_peeks 中已有的结果才可以公开。其他角色要围绕自己的真实技能、公开发言、票型和具体身份查验信息判断，不能套用经典板的预言家流程。
+"""
 
 
 def action_prompt(action: str) -> str:
@@ -109,19 +136,14 @@ def action_prompt(action: str) -> str:
     mvp = ("当前是赛后MVP票选。全部身份已经公开，请以实际贡献和对胜负的影响为准公正投票，"
            "可以投自己；target 填候选座位，text 用一到两句话概括可核对的理由，不要写长文。"
            if action == "mvp_vote" else "")
-    mirror_rules = (
-        "如果 visible_state.rules.board 是‘镜隐迷踪’，必须遵守专属规则：魔镜少女是强化版预言家，"
-        "每晚 mirror_peek 得到目标的真实具体身份，结果不是‘好人/狼人’二分。魔镜少女要按预言家思路上警、"
-        "在警上或白天公开跳魔镜少女并准确报告查验，例如‘昨晚查验3号，具体身份是守卫’，只能报告 private.mirror_peeks "
-        "中已经得到的真实结果，不能把具体身份改说成好人或狼人；没有查验记录时不得编造验人。"
-        if action in ACTION_SPEECH or action == "mirror_peek" else
-        "如果 visible_state.rules.board 是‘镜隐迷踪’，读取该板子的专属身份和技能，不要套用经典板子的身份规则。"
-    )
+    witch = ("当前是女巫夜间行动：choice 只能填 none、save 或 poison；每晚最多选择一瓶药。"
+             "选择 save 时 target 必须是今晚狼人刀口中的一名目标，选择 poison 时 target 必须是毒杀目标，"
+             "选择 none 时 target 填 null。"
+             if action == "witch_action" else "")
     return f"""你正在扮演一局12人狼人杀中的一个真实玩家，现在需要完成动作 {action}。
 输入JSON中的 visible_state 是你唯一知道的局面；严禁猜测或寻找未提供的隐藏身份，严禁读取文件或使用工具。
-{postgame}{mvp}
-{mirror_rules}
-结合公开发言、公开票型、你自己的身份/私有信息、历史立场、人格和策略认真判断。好人要分析发言与行为的一致性；狼人可以撒谎、悍跳、冲锋、倒钩或卖队友，但不要泄露狼队信息；狼人若在 private.wolf_chat 中看到队友已经安排战术，应优先执行该计划并在白天配合；神职要合理安排技能与信息公开时机。
+{postgame}{mvp}{witch}
+结合公开发言、公开票型、你自己的身份/私有信息、历史立场、人格和策略认真判断。公开历史中的每一位玩家发言（包括真人玩家的发言）都是当前轮次的有效信息，必须先读懂并在相关行动中回应，不能把真人发言当成背景噪音或直接跳过。好人要分析发言与行为的一致性；狼人可以撒谎、悍跳、冲锋、倒钩或卖队友，但不要泄露狼队信息；狼人若在 private.wolf_chat 中看到队友已经安排战术，应优先执行该计划并在白天配合；神职要合理安排技能与信息公开时机。
 memory 中的人格、说话风格和跨局摘要属于你这个固定玩家本人，请自然延续经验与性格；过去对局中的身份和结论只可作为复盘经验，不能当成当前对局的隐藏信息。
 发言必须像中文狼人杀玩家，针对具体座位和已发生事件形成连贯逻辑；允许判断错误和合理改站边，但改站边时应解释原因。不要说自己是AI，不要用概率报告或模板化空话。
 只返回符合输出结构的行动JSON。没有使用的字段填 null。target 只能从 request.allowed_targets 中选择；允许放弃的动作可填 null。除赛后复盘外 player_impressions 填 null。"""
@@ -154,6 +176,15 @@ def validate_intent(intent: Dict[str, Any], request: Dict[str, Any],
         raise ValueError(f"{label}没有决定是否退水，请重试。")
     if action == "witch_save" and not isinstance(intent.get("use"), bool):
         raise ValueError(f"{label}没有决定是否使用解药，请重试。")
+    if action == "witch_action":
+        choice = intent.get("choice")
+        target = intent.get("target")
+        if choice not in {"none", "save", "poison"}:
+            raise ValueError(f"{label}没有选择合法的药瓶，请重试。")
+        if choice == "none" and target is not None:
+            raise ValueError(f"{label}选择不用药时不能选择目标，请重试。")
+        if choice in {"save", "poison"} and target is None:
+            raise ValueError(f"{label}使用药瓶时必须选择目标，请重试。")
     if action == "sheriff_order" and intent.get("direction") not in {"forward", "reverse"}:
         raise ValueError(f"{label}警长没有选择合法发言方向，请重试。")
 
@@ -240,6 +271,19 @@ class BuiltinAIProvider(ActionProvider):
         if action in {"vote", "wolf_kill", "divine", "guard", "charm", "sheriff_recommend"}:
             target = self._pick_target(visible_state, targets, action, key)
             return {"action": action, "target": target}
+        if action == "witch_action":
+            victim = visible_state.get("private", {}).get("tonight_wolf_target")
+            victims = visible_state.get("private", {}).get("tonight_wolf_targets") or (
+                [victim] if victim else []
+            )
+            medicine = visible_state.get("private", {}).get("medicine", False)
+            poison = visible_state.get("private", {}).get("poison", False)
+            if medicine and victims and day <= 1:
+                return {"action": action, "choice": "save", "target": victims[0]}
+            if poison and day >= 2:
+                target = self._pick_target(visible_state, targets, action, key)
+                return {"action": action, "choice": "poison", "target": target}
+            return {"action": action, "choice": "none", "target": None}
         if action == "witch_save":
             victim = visible_state.get("private", {}).get("tonight_wolf_target")
             use = bool(victim) and visible_state.get("private", {}).get("medicine", False)
@@ -335,6 +379,7 @@ class BuiltinAIProvider(ActionProvider):
         seat = view["self"]["seat"]
         role = view["self"]["role"]
         private = view.get("private", {})
+        mirror_board = view.get("rules", {}).get("board") == "镜隐迷踪"
         recent = [event for event in view.get("history", []) if event.get("kind") == "speech"][-3:]
         recent_seats = [event.get("speaker") for event in recent if event.get("speaker") != seat]
         focus = recent_seats[-1] if recent_seats else next(
@@ -352,8 +397,10 @@ class BuiltinAIProvider(ActionProvider):
                     result = ROLE_LABELS.get(check.get("shown_role"), check.get("shown_role", "未知身份"))
                     return (f"我上警是因为我底牌魔镜少女，昨晚查验{check['seat']}号，具体身份是{result}。"
                             "我的查验是具体身份，不是简单的好人或狼人；后续我会继续报验人和带队。")
-                return "我上警是因为我底牌魔镜少女，查验能直接得到具体身份；我会像预言家一样公开报验人、盘逻辑和带队。"
+                return "我上警是因为我底牌魔镜少女，这是本板独立的具体身份查验信息位；我会公开报告已有查验、盘具体身份和带队。"
             if role in {"werewolf", "wolf_beauty"}:
+                if mirror_board:
+                    return f"我上警想替好人多拿一点信息。这个板子没有预言家，我会重点听{focus}号是否真正理解魔镜少女的具体身份查验和公开票型。"
                 return f"我上警想替好人多拿一点信息。现在没有必要盲信强势发言，我会重点听{focus}号的视角和后续警徽流。"
             return f"我上警不是硬跳身份，主要想把自己的视角聊清楚。{focus}号刚才的发言我还没完全听懂，后面我会根据警徽票再站边。"
         if role == "seer" and private.get("seer_checks"):
@@ -364,7 +411,7 @@ class BuiltinAIProvider(ActionProvider):
             check = private["mirror_peeks"][-1]
             result = ROLE_LABELS.get(check.get("shown_role"), check.get("shown_role", "未知身份"))
             return (f"我是魔镜少女，昨晚查验{check['seat']}号，具体身份是{result}。"
-                    f"我会按预言家视角围绕验人组织今天的判断，重点听{focus}号怎么解释。")
+                    f"我会围绕具体身份查验结果和公开票型组织今天的判断，重点听{focus}号怎么解释。")
         if role in {"werewolf", "wolf_beauty"}:
             return f"我现在不想跟着场上最响的声音走。{focus}号这轮给结论有点快，前面的票型也没解释干净，我会先听他怎么回头。"
         styles = {
@@ -476,7 +523,10 @@ class CodexFileProvider(ActionProvider):
         if not task_path.exists():
             payload = {
                 "task_id": task_id,
-                "instructions": "只返回一个符合 request 约束的 JSON 行动，不要修改游戏状态。",
+                "instructions": (
+                    "只返回一个符合 request 约束的 JSON 行动，不要修改游戏状态。"
+                    + board_rules_prompt(visible_state)
+                ),
                 "request": request,
                 "visible_state": visible_state,
             }
@@ -485,6 +535,87 @@ class CodexFileProvider(ActionProvider):
 
 
 DEFAULT_CODEX_MODEL = "gpt-5.6-sol"
+
+
+def _desktop_codex_candidates() -> List[Path]:
+    """Codex 桌面端自带的原生 ``codex.exe``。
+
+    优先用它而不是 npm 安装的 ``codex.cmd``：后者会多出
+    ``cmd.exe → node → codex.exe`` 一层包装，进程树的收尾更麻烦（见
+    :func:`_terminate_process_tree`），早期还踩过包装器初始化失败报 ``os error 5``。
+    """
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if not local_app_data:
+        return []
+    root = Path(local_app_data) / "OpenAI" / "Codex" / "bin"
+    if not root.is_dir():
+        return []
+    try:
+        return sorted(root.glob("*/codex.exe"), key=lambda path: path.stat().st_mtime, reverse=True)
+    except OSError:
+        return []
+
+
+def _terminate_process_tree(process: "subprocess.Popen[str]") -> None:
+    """Kill ``process`` **and its descendants**, then release our pipe ends.
+
+    必须是整棵树：即使直接子进程只是一个包装器，它的后代（node / codex.exe）
+    依然活着并持有继承来的管道句柄。
+    """
+    if os.name == "nt":
+        # /T 要在直接子进程还活着时执行，否则孙子进程会被漏掉。
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(process.pid)],
+                       capture_output=True, check=False)
+        try:
+            process.kill()
+        except OSError:
+            pass
+    else:
+        try:
+            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+        except OSError:
+            process.kill()
+    for stream in (process.stdin, process.stdout, process.stderr):
+        try:
+            if stream is not None:
+                stream.close()
+        except OSError:
+            pass
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def _run_cli_with_timeout(command: List[str], payload: str, timeout: int,
+                          env: Dict[str, str], creationflags: int = 0):
+    """Run one CLI action call, returning ``(returncode, stdout, stderr)``.
+
+    **不要改回 ``subprocess.run(timeout=...)``**：在 Windows 上它在超时后只杀直接
+    子进程，紧接着又调一次 ``communicate()`` 想把管道读干净；此时孙子进程仍然握着
+    继承来的管道句柄，那次 drain 会永久阻塞 —— 声明的超时形同虚设，面板会连同请求
+    锁一起卡死（2026-09-19 实战踩到：整局冻结 10 分钟以上）。
+    超时时本函数会杀掉整棵进程树并抛出 ``subprocess.TimeoutExpired``，绝不再碰管道。
+    """
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=env,
+        creationflags=creationflags,
+        # POSIX 下开新会话，超时才可能整组一起杀（见 _terminate_process_tree）。
+        start_new_session=os.name != "nt",
+    )
+    try:
+        stdout, stderr = process.communicate(payload, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _terminate_process_tree(process)
+        raise
+    return process.returncode, stdout or "", stderr or ""
 
 
 def _configured_codex_model(codex_home: Path) -> str:
@@ -526,6 +657,7 @@ class CodexCLIProvider(ActionProvider):
         # in-process app-server client with os error 5.
         candidates.extend([
             shutil.which("codex.exe"),
+            *[str(path) for path in _desktop_codex_candidates()],
             shutil.which("codex.cmd"),
             shutil.which("codex"),
         ])
@@ -541,7 +673,7 @@ class CodexCLIProvider(ActionProvider):
             ensure_ascii=False,
             separators=(",", ":"),
         )
-        prompt = self._prompt(action)
+        prompt = action_prompt(action) + board_rules_prompt(visible_state)
         try:
             with tempfile.TemporaryDirectory(prefix="aiwolf_codex_") as directory:
                 root = Path(directory)
@@ -567,25 +699,15 @@ class CodexCLIProvider(ActionProvider):
                 # provider.  Do not copy or inspect credentials in the repo.
                 environment["CODEX_HOME"] = str(self.codex_home)
                 creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-                completed = subprocess.run(
-                    command,
-                    input=payload,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    capture_output=True,
-                    timeout=self.timeout,
-                    env=environment,
-                    creationflags=creationflags,
-                    check=False,
-                )
-                if completed.returncode != 0:
-                    raise ValueError(summarize_cli_error(
-                        completed.stderr or completed.stdout or "", "Codex 玩家"))
-                raw = output_path.read_text(encoding="utf-8") if output_path.exists() else completed.stdout
+                try:
+                    returncode, stdout, stderr = _run_cli_with_timeout(
+                        command, payload, self.timeout, environment, creationflags)
+                except subprocess.TimeoutExpired as exc:
+                    raise ValueError(f"Codex 玩家思考超过 {self.timeout} 秒，请重试。") from exc
+                if returncode != 0:
+                    raise ValueError(summarize_cli_error(stderr or stdout or "", "Codex 玩家"))
+                raw = output_path.read_text(encoding="utf-8") if output_path.exists() else stdout
                 intent = json.loads(raw)
-        except subprocess.TimeoutExpired as exc:
-            raise ValueError(f"Codex 玩家思考超过 {self.timeout} 秒，请重试。") from exc
         except json.JSONDecodeError as exc:
             raise ValueError("Codex 玩家没有返回有效行动，请重试。") from exc
         validate_intent(intent, request, "Codex 玩家")
@@ -726,7 +848,7 @@ class GenericCLIProvider(ActionProvider):
             {"request": request, "visible_state": visible_state},
             ensure_ascii=False, separators=(",", ":"),
         )
-        prompt = action_prompt(action) + (
+        prompt = action_prompt(action) + board_rules_prompt(visible_state) + (
             "\n输出结构（必须严格遵守，未使用的字段填 null）：\n"
             + json.dumps(action_schema(action), ensure_ascii=False, separators=(",", ":"))
         )
@@ -761,28 +883,17 @@ class GenericCLIProvider(ActionProvider):
         environment.setdefault("PYTHONUTF8", "1")
         creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         try:
-            completed = subprocess.run(
-                argv,
-                input=stdin_text,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                capture_output=True,
-                timeout=self.timeout,
-                env=environment,
-                creationflags=creationflags,
-                check=False,
-            )
+            returncode, stdout, stderr = _run_cli_with_timeout(
+                argv, stdin_text, self.timeout, environment, creationflags)
         except FileNotFoundError as exc:
             raise ValueError(f"无法启动 {self.backend.label}：{exc}") from exc
         except subprocess.TimeoutExpired as exc:
             raise ValueError(
                 f"{self.backend.label} 思考超过 {self.timeout} 秒，请重试或换更快的后端。"
             ) from exc
-        if completed.returncode != 0:
-            raise ValueError(summarize_cli_error(
-                completed.stderr or completed.stdout or "", self.backend.label))
-        return completed.stdout or ""
+        if returncode != 0:
+            raise ValueError(summarize_cli_error(stderr or stdout or "", self.backend.label))
+        return stdout
 
 
 class ProviderFailure(ValueError):
@@ -914,7 +1025,7 @@ class ApiProvider(ActionProvider):
     def request_action(self, visible_state, request):
         action = request["action"]
         schema = action_schema(action)
-        system = action_prompt(action) + (
+        system = action_prompt(action) + board_rules_prompt(visible_state) + (
             "\n输出结构（必须严格遵守，未使用的字段填 null）：\n"
             + json.dumps(schema, ensure_ascii=False, separators=(",", ":"))
         )

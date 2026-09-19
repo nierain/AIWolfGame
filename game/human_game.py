@@ -39,12 +39,33 @@ BOARD_NAMES = {
     "classic": "预女骑守 + 狼美人",
     "mirror": "镜隐迷踪",
 }
+BOARD_ROLE_RULES = {
+    "classic": (
+        "经典板：预言家、女巫、骑士、守卫、狼美人、3名狼人和4名平民。"
+        "预言家是二分查验信息位。"
+    ),
+    "mirror": (
+        "镜隐迷踪板：3名狼人、觉醒隐狼、魔镜少女、守卫、女巫、猎人和4名平民。"
+        "本板没有预言家、骑士或狼美人；魔镜少女是独立的具体身份查验信息位，"
+        "每晚查验一名玩家并得到其真实具体身份。觉醒隐狼第1夜学习一名玩家并继承其身份技能，"
+        "与3名小狼互不知身份。"
+    ),
+}
 # 隐狼学到的身份 → 它对魔镜少女显现的身份（学什么显示什么，学狼人显示"狼人"）
 HIDDEN_WOLF_LEARNABLE = {
     "witch": "witch", "seer": "seer", "guard": "guard", "hunter": "hunter",
     "villager": "villager", "werewolf": "werewolf", "wolf_beauty": "werewolf",
-    "hidden_wolf": "werewolf",
+    "hidden_wolf": "werewolf", "mirror_maiden": "mirror_maiden",
 }
+
+
+def _peek_shown_role(state: Dict[str, Any], target: int) -> str:
+    """查验一名玩家时看到的身份：隐狼按它学到的身份显示，其余显示真实身份。"""
+    real = _role(state, target)
+    if real != "hidden_wolf":
+        return real
+    learned = state["abilities"]["hidden_wolf_learned"].get(str(target))
+    return HIDDEN_WOLF_LEARNABLE.get(learned, learned)
 
 
 def setup_state() -> Dict[str, Any]:
@@ -109,8 +130,9 @@ def create_game(human_seat: int = 0, debug_role: str = "random",
             "knight_used": False, "seer_checks": {}, "beauty_charm": {},
             # 镜隐迷踪专用
             "hidden_wolf_learned": {},   # {seat: learned_role}
+            "hidden_wolf_learn_target": {},  # {seat: target_seat}
             "hidden_wolf_poison": True,  # 隐狼学到女巫后继承的"救不活的毒"
-            "hidden_wolf_checks": {},    # 隐狼学到预言家后的查验记录
+            "hidden_wolf_checks": {},    # 隐狼继承查验技能的记录（预言家记 is_wolf，魔镜少女记 shown_role）
             "hidden_wolf_guard_last": None,  # 隐狼学到守卫后的连守记录
             "hunter_shots": {},          # {seat: True 已开枪}
         },
@@ -133,6 +155,7 @@ def create_game(human_seat: int = 0, debug_role: str = "random",
         },
         "rules": {
             "board": BOARD_NAMES[board], "win_condition": "屠边",
+            "role_rules": BOARD_ROLE_RULES[board],
             "sheriff_vote_weight": 1.5, "guard_cannot_repeat": True,
             "guard_save_conflict_kills": True,
             "wolf_can_self_kill": bool(wolf_self_kill),
@@ -250,6 +273,8 @@ def _targets_for(state: Dict[str, Any], actor: int, action: str) -> List[int]:
         return targets
     if action == "witch_poison":
         return [seat for seat in alive if seat != actor]
+    if action == "witch_action":
+        return [seat for seat in alive if seat != actor]
     if action in {"vote", "sheriff_recommend"}:
         fixed = state["phase_data"].get("fixed_allowed")
         return list(fixed) if fixed is not None else [seat for seat in alive if seat != actor]
@@ -273,9 +298,22 @@ def _queue_request(state: Dict[str, Any]) -> None:
     if allowed is None:
         allowed = _targets_for(state, actor, action)
     prompt = data.get("prompt", "")
-    if action == "witch_save":
+    if action in {"witch_save", "witch_action"}:
+        victims = []
         victim = state["night"].get("wolf_target")
-        prompt = f"今晚{victim}号被狼人袭击，是否使用解药？" if victim else "今晚无人被狼人袭击。"
+        if victim:
+            victims.append(victim)
+        for target in state["night"].get("wolf_targets", []):
+            if target and target not in victims:
+                victims.append(target)
+        if action == "witch_action":
+            victim_label = "、".join(f"{target}号" for target in victims)
+            prompt = (f"今晚{victim_label}被狼人袭击。请选择一瓶药：不用、毒药或解药；"
+                      "女巫每晚最多使用一瓶药。使用药瓶时还要选择目标。"
+                      if victims else
+                      "今晚无人被狼人袭击。请选择是否使用毒药；女巫每晚最多使用一瓶药。")
+        else:
+            prompt = f"今晚{victim}号被狼人袭击，是否使用解药？" if victim else "今晚无人被狼人袭击。"
     _request(state, actor, action, allowed, prompt)
 
 
@@ -288,6 +326,8 @@ def _start_night(state: Dict[str, Any]) -> None:
     state["phase"] = "night_wolf_chat"
     state["night"] = {"wolf_votes": {}, "wolf_target": None, "guard": None,
                       "saved": False, "poison": None, "deaths": [],
+                      "saved_target": None,
+                      "witch_action_used": False,
                       "wolf_targets": [],  # mirror 板子双刀用（小狼刀 + 隐狼刀）
                       "hidden_poison": None, "hidden_guard": None}
     wolves = [seat for seat in _alive(state) if _role(state, seat) in WOLF_ROLES]
@@ -306,9 +346,14 @@ def _start_night(state: Dict[str, Any]) -> None:
 
 
 def _start_hidden_wolf_learn(state: Dict[str, Any]) -> None:
-    """镜隐迷踪：第 1 夜隐狼学习一名玩家（终身固定，不能学自己）。"""
+    """镜隐迷踪：第 1 夜隐狼学习一名玩家（终身固定，不能学自己）。
+
+    学习只发生在第 1 夜（``day == 0``）；学过之后终身固定，从第 2 夜起不再询问。
+    ``hidden_wolf_learned`` 的键是字符串座位号，判断时必须用 ``str(seat)``。
+    """
     hidden = _alive_role(state, "hidden_wolf")
-    if hidden and not any(seat in state["abilities"]["hidden_wolf_learned"] for seat in hidden):
+    learned = state["abilities"]["hidden_wolf_learned"]
+    if state["day"] == 0 and hidden and not any(str(seat) in learned for seat in hidden):
         _start_queue(state, "night_hidden_learn", "hidden_learn", hidden,
                      prompt="选择一名玩家学习，获得其身份与技能（不能学自己，终身固定）。")
     else:
@@ -355,8 +400,9 @@ def _mirror_queue_complete(state: Dict[str, Any], phase: str) -> None:
         _start_queue(state, "night_guard", "guard", _alive_role(state, "guard"),
                      prompt="选择今晚的守护目标，不能连续两晚守同一人。")
     elif phase == "night_guard":
-        _start_queue(state, "night_witch_save", "witch_save", _alive_role(state, "witch"),
-                     prompt="今晚狼人袭击了目标，是否使用解药？")
+        _start_witch_action(state)
+    elif phase == "night_witch_action":
+        _resolve_night(state)
     elif phase == "night_witch_save":
         _start_witch_poison(state)
     elif phase == "night_witch_poison":
@@ -401,6 +447,11 @@ def _mirror_start_hidden_skill(state: Dict[str, Any]) -> None:
             _start_queue(state, "night_hidden_skill", "hidden_skill", [seat],
                          prompt="你学的是预言家，可查验一名玩家。")
             state["phase_data"]["skill"] = "seer"
+            return
+        if learned == "mirror_maiden":
+            _start_queue(state, "night_hidden_skill", "hidden_skill", [seat],
+                         prompt="你学的是魔镜少女，可查验一名玩家的具体身份。")
+            state["phase_data"]["skill"] = "peek"
             return
         if learned == "guard":
             _start_queue(state, "night_hidden_skill", "hidden_skill", [seat],
@@ -511,7 +562,7 @@ def _queue_complete(state: Dict[str, Any]) -> None:
     if state.get("board") == "mirror" and phase in {
         "night_hidden_learn", "night_wolf_chat", "night_wolf_vote",
         "night_hidden_blade", "night_maiden", "night_hidden_skill",
-        "night_guard", "night_witch_save", "night_witch_poison",
+        "night_guard", "night_witch_action", "night_witch_save", "night_witch_poison",
     }:
         _mirror_queue_complete(state, phase)
         return
@@ -536,11 +587,9 @@ def _queue_complete(state: Dict[str, Any]) -> None:
         _start_queue(state, "night_seer", "divine", _alive_role(state, "seer"),
                      prompt="选择一名存活玩家查验。")
     elif phase == "night_seer":
-        witches = _alive_role(state, "witch")
-        if witches and state["abilities"]["witch_medicine"]:
-            _start_queue(state, "night_witch_save", "witch_save", witches)
-        else:
-            _start_witch_poison(state)
+        _start_witch_action(state)
+    elif phase == "night_witch_action":
+        _resolve_night(state)
     elif phase == "night_witch_save":
         _start_witch_poison(state)
     elif phase == "night_witch_poison":
@@ -600,9 +649,21 @@ def _queue_complete(state: Dict[str, Any]) -> None:
         raise RuntimeError(f"未处理的阶段结束: {phase}")
 
 
-def _start_witch_poison(state: Dict[str, Any]) -> None:
+def _start_witch_action(state: Dict[str, Any]) -> None:
     witches = _alive_role(state, "witch")
-    if witches and state["abilities"]["witch_poison"]:
+    if witches and (state["abilities"]["witch_medicine"] or state["abilities"]["witch_poison"]):
+        _start_queue(state, "night_witch_action", "witch_action", witches,
+                     prompt="选择药瓶：不用、毒药或解药；每晚最多使用一瓶药。")
+    else:
+        _resolve_night(state)
+
+
+def _start_witch_poison(state: Dict[str, Any]) -> None:
+    """兼容旧存档；新对局统一走一次性的 witch_action。"""
+    witches = _alive_role(state, "witch")
+    if state["night"].get("witch_action_used"):
+        _resolve_night(state)
+    elif witches and state["abilities"]["witch_poison"]:
         _start_queue(state, "night_witch_poison", "witch_poison", witches,
                      prompt="选择是否使用毒药；可以不使用。")
     else:
@@ -611,9 +672,31 @@ def _start_witch_poison(state: Dict[str, Any]) -> None:
 
 def _resolve_night(state: Dict[str, Any]) -> None:
     night = state["night"]
-    guard = night.get("guard")
-    saved = night.get("saved", False)
+    # ``witch_action`` is the current one-step UI.  Older saves may still
+    # contain the two-step ``witch_save``/``witch_poison`` fields, so resolve
+    # the bottle choice defensively here as well: a malformed/legacy night
+    # carrying both can never apply both bottles.  ``witch_choice`` is
+    # authoritative for new games; for old saves a used antidote wins over a
+    # stray poison field because it is the first action in that legacy chain.
+    witch_choice = night.get("witch_choice")
+    saved = bool(night.get("saved", False))
+    saved_target = night.get("saved_target") or night.get("wolf_target")
+    poisoned = night.get("poison")
+    if witch_choice == "save":
+        poisoned = None
+    elif witch_choice == "poison":
+        saved = False
+    elif saved:
+        poisoned = None
+    # Keep the normalized choice visible to the later death-report step too.
+    night["poison"] = poisoned
+
+    guard_targets = {
+        target for target in (night.get("guard"), night.get("hidden_guard"))
+        if target
+    }
     deaths: List[int] = []
+    conflict_targets: List[int] = []
 
     if state.get("board") == "mirror":
         # 双刀：小狼刀 + 隐狼刀（可能只有一把）
@@ -624,9 +707,13 @@ def _resolve_night(state: Dict[str, Any]) -> None:
             if t and t not in targets:
                 targets.append(t)
         for victim in targets:
-            protected = victim == guard or saved
-            if victim == guard and saved and state["rules"]["guard_save_conflict_kills"]:
+            # The antidote only saves the actual wolf target.  In a mirror
+            # double-kill it must not accidentally shield the second victim.
+            protected = victim in guard_targets or (saved and victim == saved_target)
+            if (victim in guard_targets and saved and victim == saved_target
+                    and state["rules"]["guard_save_conflict_kills"]):
                 protected = False
+                conflict_targets.append(victim)
             if not protected:
                 if victim not in deaths:
                     deaths.append(victim)
@@ -637,14 +724,23 @@ def _resolve_night(state: Dict[str, Any]) -> None:
     else:
         victim = night.get("wolf_target")
         if victim:
-            protected = victim == guard or saved
-            if victim == guard and saved and state["rules"]["guard_save_conflict_kills"]:
+            protected = victim in guard_targets or (saved and victim == saved_target)
+            if (victim in guard_targets and saved
+                    and state["rules"]["guard_save_conflict_kills"]):
                 protected = False
+                conflict_targets = [victim]
             if not protected:
                 deaths.append(victim)
 
-    poisoned = night.get("poison")
-    if poisoned and poisoned not in deaths:
+    for victim in conflict_targets:
+        _add_event(state, "system",
+                   f"{victim}号同时被守卫守护并被解药救治，触发奶穿，仍然出局。",
+                   phase="night_witch_action")
+
+    # A normal guard does not block poison, but the inherited guard skill on
+    # the mirror board explicitly can.  The conflict rule above still applies
+    # to a wolf attack + real/hidden shield + antidote (奶穿).
+    if poisoned and poisoned != night.get("hidden_guard") and poisoned not in deaths:
         deaths.append(poisoned)
     night["deaths"] = deaths
     state["day"] += 1
@@ -956,8 +1052,10 @@ def _finish_if_needed(state: Dict[str, Any]) -> bool:
 
 
 def _start_postgame_debrief(state: Dict[str, Any]) -> None:
+    human = state["human_seat"]
+    actors = [human] + [seat for seat in range(1, 13) if seat != human]
     _start_queue(
-        state, "post_game_speech", "postgame_speech", range(1, 13),
+        state, "post_game_speech", "postgame_speech", actors,
         prompt=("赛后身份已经全部公开，请先以最终身份表为准，说说自己的感想、关键判断和整局思路；"
                 "再自然评价2至4位给你留下特别印象的选手，说明具体原因。"),
         include_dead=True,
@@ -1104,8 +1202,16 @@ def get_visible_state(state: Dict[str, Any], seat: int) -> Dict[str, Any]:
     if own_role == "witch":
         private["medicine"] = state["abilities"]["witch_medicine"]
         private["poison"] = state["abilities"]["witch_poison"]
-        if state["phase"] in {"night_witch_save", "night_witch_poison"}:
-            private["tonight_wolf_target"] = state["night"].get("wolf_target")
+        if state["phase"] in {"night_witch_action", "night_witch_save", "night_witch_poison"}:
+            victims = []
+            victim = state["night"].get("wolf_target")
+            if victim:
+                victims.append(victim)
+            for target in state["night"].get("wolf_targets", []):
+                if target and target not in victims:
+                    victims.append(target)
+            private["tonight_wolf_target"] = victim
+            private["tonight_wolf_targets"] = victims
     if own_role == "guard":
         private["last_guarded"] = state["abilities"]["guard_last"]
     if own_role == "knight":
@@ -1114,7 +1220,8 @@ def get_visible_state(state: Dict[str, Any], seat: int) -> Dict[str, Any]:
         private["charmed_player"] = state["abilities"]["beauty_charm"].get(str(seat))
     if own_role == "hidden_wolf":
         private["learned_role"] = state["abilities"]["hidden_wolf_learned"].get(str(seat))
-        if private["learned_role"] == "seer":
+        private["learned_target"] = state["abilities"].get("hidden_wolf_learn_target", {}).get(str(seat))
+        if private["learned_role"] in {"seer", "mirror_maiden"}:
             private["hidden_checks"] = deepcopy(state["abilities"]["hidden_wolf_checks"].get(str(seat), []))
         if private["learned_role"] == "witch":
             private["hidden_poison"] = state["abilities"]["hidden_wolf_poison"]
@@ -1293,6 +1400,7 @@ class HumanGameEngine:
             target = _target(intent, allowed)
             learned = _role(state, target)
             state["abilities"]["hidden_wolf_learned"][str(actor)] = learned
+            state["abilities"].setdefault("hidden_wolf_learn_target", {})[str(actor)] = target
             _remember(state, actor, "note", {"day": state["day"] + 1, "learned": learned, "target": target})
         elif action == "hidden_blade":
             # 隐狼带刀：学狼人可双刀（两个不同目标）
@@ -1315,6 +1423,12 @@ class HumanGameEngine:
                 check = {"day": state["day"] + 1, "seat": target,
                          "is_wolf": _role(state, target) in WOLF_ROLES}
                 state["abilities"]["hidden_wolf_checks"].setdefault(str(actor), []).append(check)
+            elif skill == "peek":
+                if target is None:
+                    raise ValueError("请选择查验目标")
+                check = {"day": state["day"] + 1, "seat": target,
+                         "shown_role": _peek_shown_role(state, target)}
+                state["abilities"]["hidden_wolf_checks"].setdefault(str(actor), []).append(check)
             elif skill == "guard":
                 if target is None:
                     target = _target(intent, allowed)
@@ -1326,17 +1440,50 @@ class HumanGameEngine:
                     state["night"]["hidden_poison"] = target
         elif action == "mirror_peek":
             target = _target(intent, allowed)
-            real = _role(state, target)
-            if real == "hidden_wolf":
-                # 隐狼：显示它学到的角色（学什么显示什么）
-                learned = state["abilities"]["hidden_wolf_learned"].get(str(target))
-                shown = HIDDEN_WOLF_LEARNABLE.get(learned, learned)
-            else:
-                shown = real
-            check = {"day": state["day"] + 1, "seat": target, "shown_role": shown}
+            check = {"day": state["day"] + 1, "seat": target,
+                     "shown_role": _peek_shown_role(state, target)}
             state["abilities"].setdefault("mirror_peeks", {}).setdefault(str(actor), []).append(check)
+        elif action == "witch_action":
+            choice = str(intent.get("choice") or "none")
+            if choice not in {"none", "save", "poison"}:
+                raise ValueError("女巫请选择不用、毒药或解药")
+            if state["night"].get("witch_action_used"):
+                raise ValueError("女巫每晚最多使用一瓶药")
+            target = intent.get("target")
+            if target is not None:
+                target = int(target)
+            if choice == "none":
+                if target is not None:
+                    raise ValueError("选择不用药时不能选择目标")
+            elif choice == "save":
+                victims = []
+                victim = state["night"].get("wolf_target")
+                if victim:
+                    victims.append(victim)
+                for target in state["night"].get("wolf_targets", []):
+                    if target and target not in victims:
+                        victims.append(target)
+                if not state["abilities"]["witch_medicine"]:
+                    raise ValueError("解药已经使用")
+                if not victims:
+                    raise ValueError("今晚没有狼人刀口，不能使用解药")
+                if target not in victims:
+                    raise ValueError("解药只能选择今晚被狼人袭击的玩家")
+                state["abilities"]["witch_medicine"] = False
+                state["night"]["saved"] = True
+                state["night"]["saved_target"] = target
+            else:
+                if not state["abilities"]["witch_poison"]:
+                    raise ValueError("毒药已经使用")
+                target = _target(intent, allowed)
+                state["abilities"]["witch_poison"] = False
+                state["night"]["poison"] = target
+            state["night"]["witch_action_used"] = True
+            state["night"]["witch_choice"] = choice
         elif action == "witch_save":
             use = bool(intent.get("use"))
+            if use and state["night"].get("witch_action_used"):
+                raise ValueError("女巫每晚最多使用一瓶药")
             if use and not state["abilities"]["witch_medicine"]:
                 raise ValueError("解药已经使用")
             if use and not state["night"].get("wolf_target"):
@@ -1344,11 +1491,16 @@ class HumanGameEngine:
             if use:
                 state["abilities"]["witch_medicine"] = False
                 state["night"]["saved"] = True
+                state["night"]["saved_target"] = state["night"].get("wolf_target")
+                state["night"]["witch_action_used"] = True
         elif action == "witch_poison":
+            if state["night"].get("witch_action_used"):
+                raise ValueError("女巫每晚最多使用一瓶药")
             target = _optional_target(intent, allowed)
             if target is not None:
                 state["abilities"]["witch_poison"] = False
                 state["night"]["poison"] = target
+                state["night"]["witch_action_used"] = True
         elif action == "campaign":
             joins = bool(intent.get("join"))
             state["phase_data"]["campaign_decisions"][str(actor)] = joins

@@ -27,6 +27,12 @@ WEB_ROOT = ROOT / "web"
 STATE_FILE = ROOT / ".panel_game_state.json"
 BRIDGE_ROOT = ROOT / "codex_bridge"
 LOCK = threading.Lock()
+# ``new_game`` must be able to interrupt an in-flight model request.  The
+# normal action lock is intentionally held while an AI provider thinks, so a
+# second lock plus a generation counter lets reset write the setup state
+# immediately and makes the old request discard its eventual result.
+RESET_LOCK = threading.Lock()
+RESET_VERSION = 0
 
 
 class SetupProvider(ActionProvider):
@@ -246,10 +252,24 @@ class PanelHandler(SimpleHTTPRequestHandler):
         try:
             length = int(self.headers.get("Content-Length", "0"))
             payload = json.loads(self.rfile.read(length) or b"{}")
+            if payload.get("action") == "new_game":
+                global RESET_VERSION
+                with RESET_LOCK:
+                    RESET_VERSION += 1
+                    state = apply_action(load_state(), payload)
+                    save_state(state)
+                    response = panel_state(state)
+                self.send_json(response)
+                return
             with LOCK:
+                request_version = RESET_VERSION
                 state = apply_action(load_state(), payload)
-                save_state(state)
-                response = panel_state(state)
+                with RESET_LOCK:
+                    if request_version != RESET_VERSION:
+                        response = panel_state(load_state())
+                    else:
+                        save_state(state)
+                        response = panel_state(state)
             self.send_json(response)
         except (ValueError, TypeError, json.JSONDecodeError) as exc:
             self.send_json({"error": str(exc)}, 400)
